@@ -50,6 +50,19 @@ type Task = {
   tag_names: string[];
   tag_colors: string[];
   workspace_id?: string;
+  // Dependency fields
+  has_blockers?: boolean;
+  is_blocked?: boolean;
+  blocker_count?: number;
+  incomplete_blocker_count?: number;
+};
+
+type TaskDependency = {
+  id: string;
+  title: string;
+  status: string;
+  priority: string;
+  dependency_created_at: string;
 };
 
 type Tag = {
@@ -171,6 +184,8 @@ export default function Dashboard() {
   const [newDocName, setNewDocName] = useState('');
   const currentWorkspace = 'default'; // Hardcoded for v1
   const [taskMessages, setTaskMessages] = useState<{id: string; content: string; from_agent_name: string; avatar_emoji: string; created_at: string}[]>([]);
+  const [taskDependencies, setTaskDependencies] = useState<{blockers: TaskDependency[]; blocking: TaskDependency[]; is_blocked: boolean}>({blockers: [], blocking: [], is_blocked: false});
+  const [showAddDependency, setShowAddDependency] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [teams, setTeams] = useState<Team[]>([]);
@@ -368,9 +383,52 @@ export default function Dashboard() {
 
   async function selectTask(task: Task) {
     setSelectedTask(task);
-    // Load messages for this task
-    const data = await fetchAPI(`/api/tasks/${task.id}/messages`);
-    setTaskMessages(data.messages || []);
+    setShowAddDependency(false);
+    // Load messages and dependencies for this task
+    const [msgData, depData] = await Promise.all([
+      fetchAPI(`/api/tasks/${task.id}/messages`),
+      fetchAPI(`/api/tasks/${task.id}/dependencies`),
+    ]);
+    setTaskMessages(msgData?.messages || []);
+    setTaskDependencies({
+      blockers: depData?.blockers || [],
+      blocking: depData?.blocking || [],
+      is_blocked: depData?.is_blocked || false,
+    });
+  }
+
+  async function addDependency(taskId: string, dependsOnId: string) {
+    const result = await fetchAPI(`/api/tasks/${taskId}/dependencies`, {
+      method: 'POST',
+      body: JSON.stringify({ depends_on_task_id: dependsOnId }),
+    });
+    if (result?.error) {
+      alert(result.error);
+      return;
+    }
+    // Reload dependencies and task list
+    const depData = await fetchAPI(`/api/tasks/${taskId}/dependencies`);
+    setTaskDependencies({
+      blockers: depData?.blockers || [],
+      blocking: depData?.blocking || [],
+      is_blocked: depData?.is_blocked || false,
+    });
+    loadData();
+    setShowAddDependency(false);
+  }
+
+  async function removeDependency(taskId: string, depId: string) {
+    await fetchAPI(`/api/tasks/${taskId}/dependencies/${depId}`, {
+      method: 'DELETE',
+    });
+    // Reload dependencies and task list
+    const depData = await fetchAPI(`/api/tasks/${taskId}/dependencies`);
+    setTaskDependencies({
+      blockers: depData?.blockers || [],
+      blocking: depData?.blocking || [],
+      is_blocked: depData?.is_blocked || false,
+    });
+    loadData();
   }
 
   // Filter tasks by workspace if selected
@@ -654,21 +712,35 @@ export default function Dashboard() {
                   <div className="bg-stone-100 rounded-b p-2 min-h-[300px] md:min-h-[400px] space-y-2">
                     {tasksByStatus[status]?.map(task => {
                       const dueInfo = formatDueDate(task.due_date, task.status);
+                      const isBlocked = task.is_blocked || task.status === 'blocked';
                       return (
                         <div
                           key={task.id}
                           onClick={() => selectTask(task)}
                           className={`bg-white rounded p-3 shadow-sm border cursor-pointer hover:shadow-md transition-shadow ${
+                            isBlocked ? 'border-l-4 border-l-orange-500 border-stone-200 bg-orange-50/50' :
                             dueInfo.isOverdue ? 'border-l-4 border-l-red-500 border-stone-200' : 'border-stone-200'
                           }`}
                         >
-                          <div className="font-medium text-stone-800 text-sm">{task.title}</div>
-                          {task.assignee_names?.length > 0 && (
-                            <div className="text-xs text-stone-500 mt-1">
-                              {task.assignee_names.join(', ')}
+                          <div className="flex items-start gap-2">
+                            <div className="flex-1">
+                              <div className="font-medium text-stone-800 text-sm">{task.title}</div>
+                              {task.assignee_names?.length > 0 && (
+                                <div className="text-xs text-stone-500 mt-1">
+                                  {task.assignee_names.join(', ')}
+                                </div>
+                              )}
                             </div>
-                          )}
+                            {isBlocked && (
+                              <span className="text-orange-500 text-lg" title="Blocked by dependencies">🔒</span>
+                            )}
+                          </div>
                           <div className="flex flex-wrap gap-1 mt-2">
+                            {isBlocked && (
+                              <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded flex items-center gap-1">
+                                🔒 Blocked
+                              </span>
+                            )}
                             {task.priority === 'urgent' && (
                               <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded">
                                 Urgent
@@ -684,6 +756,11 @@ export default function Dashboard() {
                             {task.estimated_minutes && (
                               <span className="text-xs bg-stone-100 text-stone-600 px-2 py-0.5 rounded">
                                 ⏱ {formatEstimate(task.estimated_minutes)}
+                              </span>
+                            )}
+                            {task.has_blockers && !isBlocked && (
+                              <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded" title="Has dependencies (all complete)">
+                                ✓ Deps OK
                               </span>
                             )}
                             {task.tag_names?.map((tagName, i) => (
@@ -772,7 +849,7 @@ export default function Dashboard() {
               <div className="bg-white rounded-lg p-4 md:p-6 w-full max-w-lg shadow-xl max-h-[90vh] overflow-y-auto">
                 <div className="flex justify-between items-start mb-4">
                   <h3 className="font-serif text-xl font-semibold">{selectedTask.title}</h3>
-                  <button onClick={() => { setSelectedTask(null); setTaskMessages([]); }} className="text-stone-400 hover:text-stone-600">
+                  <button onClick={() => { setSelectedTask(null); setTaskMessages([]); setTaskDependencies({blockers: [], blocking: [], is_blocked: false}); setShowAddDependency(false); }} className="text-stone-400 hover:text-stone-600">
                     ✕
                   </button>
                 </div>
@@ -937,6 +1014,111 @@ export default function Dashboard() {
                     </div>
                   </div>
                 )}
+
+                {/* Dependencies Section */}
+                <div className="mb-4 p-3 bg-stone-50 rounded-lg border border-stone-200">
+                  <div className="flex justify-between items-center mb-3">
+                    <h4 className="text-sm font-medium text-stone-700">
+                      🔗 Dependencies
+                    </h4>
+                    <button
+                      onClick={() => setShowAddDependency(!showAddDependency)}
+                      className="text-xs bg-stone-200 hover:bg-stone-300 px-2 py-1 rounded"
+                    >
+                      {showAddDependency ? 'Cancel' : '+ Add Blocker'}
+                    </button>
+                  </div>
+
+                  {/* Add Dependency UI */}
+                  {showAddDependency && (
+                    <div className="mb-3 p-2 bg-white rounded border border-stone-200">
+                      <p className="text-xs text-stone-500 mb-2">Select a task that blocks this one:</p>
+                      <div className="max-h-40 overflow-y-auto space-y-1">
+                        {tasks.filter(t => 
+                          t.id !== selectedTask?.id && 
+                          t.status !== 'done' &&
+                          !taskDependencies.blockers.some(b => b.id === t.id)
+                        ).map(t => (
+                          <button
+                            key={t.id}
+                            onClick={() => addDependency(selectedTask!.id, t.id)}
+                            className="w-full text-left px-2 py-1 text-xs rounded hover:bg-stone-100 flex items-center gap-2"
+                          >
+                            <span className={`w-2 h-2 rounded-full ${
+                              t.status === 'in_progress' ? 'bg-blue-500' :
+                              t.status === 'review' ? 'bg-amber-500' :
+                              'bg-stone-400'
+                            }`}></span>
+                            <span className="truncate flex-1">{t.title}</span>
+                            <span className="text-stone-400">{t.status}</span>
+                          </button>
+                        ))}
+                        {tasks.filter(t => 
+                          t.id !== selectedTask?.id && 
+                          t.status !== 'done' &&
+                          !taskDependencies.blockers.some(b => b.id === t.id)
+                        ).length === 0 && (
+                          <p className="text-xs text-stone-400 italic p-2">No available tasks to add as blockers</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Blockers (tasks this task depends on) */}
+                  {taskDependencies.blockers.length > 0 && (
+                    <div className="mb-2">
+                      <p className="text-xs text-stone-500 mb-1">⛔ Blocked by:</p>
+                      <div className="space-y-1">
+                        {taskDependencies.blockers.map(blocker => (
+                          <div 
+                            key={blocker.id}
+                            className={`flex items-center justify-between px-2 py-1 rounded text-xs ${
+                              blocker.status === 'done' ? 'bg-green-50 border border-green-200' : 'bg-orange-50 border border-orange-200'
+                            }`}
+                          >
+                            <div className="flex items-center gap-2 flex-1 min-w-0">
+                              <span>{blocker.status === 'done' ? '✅' : '🔒'}</span>
+                              <span className="truncate">{blocker.title}</span>
+                              <span className={`px-1.5 py-0.5 rounded text-[10px] ${
+                                blocker.status === 'done' ? 'bg-green-100 text-green-700' : 'bg-orange-100 text-orange-700'
+                              }`}>{blocker.status}</span>
+                            </div>
+                            <button
+                              onClick={() => removeDependency(selectedTask!.id, blocker.id)}
+                              className="text-stone-400 hover:text-red-500 ml-2"
+                              title="Remove dependency"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Blocking (tasks that depend on this task) */}
+                  {taskDependencies.blocking.length > 0 && (
+                    <div>
+                      <p className="text-xs text-stone-500 mb-1">⏳ Blocks these tasks:</p>
+                      <div className="space-y-1">
+                        {taskDependencies.blocking.map(blocked => (
+                          <div 
+                            key={blocked.id}
+                            className="flex items-center gap-2 px-2 py-1 rounded text-xs bg-blue-50 border border-blue-200"
+                          >
+                            <span>➡️</span>
+                            <span className="truncate flex-1">{blocked.title}</span>
+                            <span className="px-1.5 py-0.5 rounded text-[10px] bg-blue-100 text-blue-700">{blocked.status}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {taskDependencies.blockers.length === 0 && taskDependencies.blocking.length === 0 && !showAddDependency && (
+                    <p className="text-xs text-stone-400 italic">No dependencies</p>
+                  )}
+                </div>
 
                 {/* Comments/Messages Section */}
                 {taskMessages.length > 0 && (

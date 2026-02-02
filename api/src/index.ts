@@ -233,7 +233,11 @@ app.get('/api/tasks', async (c) => {
       GROUP_CONCAT(DISTINCT a.name) as assignee_names,
       GROUP_CONCAT(DISTINCT tg.tag_id) as tag_ids,
       GROUP_CONCAT(DISTINCT tags.name) as tag_names,
-      GROUP_CONCAT(DISTINCT tags.color) as tag_colors
+      GROUP_CONCAT(DISTINCT tags.color) as tag_colors,
+      (SELECT COUNT(*) FROM task_dependencies WHERE task_id = t.id) as blocker_count,
+      (SELECT COUNT(*) FROM task_dependencies td2 
+       JOIN tasks t2 ON t2.id = td2.depends_on_task_id 
+       WHERE td2.task_id = t.id AND t2.status != 'done') as incomplete_blocker_count
     FROM tasks t
     LEFT JOIN task_assignees ta ON t.id = ta.task_id
     LEFT JOIN agents a ON ta.agent_id = a.id
@@ -263,7 +267,7 @@ app.get('/api/tasks', async (c) => {
   const stmt = c.env.DB.prepare(query);
   const result = bindings.length > 0 ? await stmt.bind(...bindings).all() : await stmt.all();
   
-  // Parse assignee and tag arrays
+  // Parse assignee and tag arrays, add dependency info
   const tasks = result.results.map((t: any) => ({
     ...t,
     assignee_ids: t.assignee_ids ? t.assignee_ids.split(',') : [],
@@ -271,6 +275,8 @@ app.get('/api/tasks', async (c) => {
     tag_ids: t.tag_ids ? t.tag_ids.split(',') : [],
     tag_names: t.tag_names ? t.tag_names.split(',') : [],
     tag_colors: t.tag_colors ? t.tag_colors.split(',') : [],
+    has_blockers: (t.blocker_count || 0) > 0,
+    is_blocked: (t.incomplete_blocker_count || 0) > 0,
   }));
   
   return c.json({ tasks });
@@ -351,6 +357,24 @@ app.patch('/api/tasks/:id', async (c) => {
   
   const oldTask = await c.env.DB.prepare('SELECT status FROM tasks WHERE id = ?').bind(id).first() as any;
   
+  // STATUS GUARD: Check dependencies before allowing transition to in_progress
+  if (body.status === 'in_progress' && oldTask?.status !== 'in_progress') {
+    const incompleteBlockers = await c.env.DB.prepare(`
+      SELECT t.id, t.title FROM task_dependencies td
+      JOIN tasks t ON t.id = td.depends_on_task_id
+      WHERE td.task_id = ? AND t.status != 'done'
+    `).bind(id).all();
+    
+    if (incompleteBlockers.results.length > 0) {
+      const blockerTitles = (incompleteBlockers.results as any[]).map(b => b.title).join(', ');
+      return c.json({ 
+        error: 'Cannot start task - blocked by incomplete dependencies',
+        blockers: incompleteBlockers.results,
+        message: `Blocked by: ${blockerTitles}`
+      }, 409);
+    }
+  }
+  
   const updates: string[] = [];
   const values: any[] = [];
   
@@ -373,6 +397,11 @@ app.patch('/api/tasks/:id', async (c) => {
     
     // Notify subscribers
     await notifySubscribers(c.env.DB, id, `Task status changed to ${body.status}`, 'status_change');
+    
+    // If task completed, check if any dependent tasks can be unblocked
+    if (body.status === 'done') {
+      await checkAndUnblockDependents(c.env.DB, id);
+    }
   }
   
   return c.json({ success: true });
@@ -627,6 +656,9 @@ app.post('/api/tasks/:id/approve', async (c) => {
     }
   }
   
+  // Check if any dependent tasks can be unblocked
+  await checkAndUnblockDependents(c.env.DB, taskId);
+  
   return c.json({ success: true });
 });
 
@@ -763,6 +795,181 @@ app.post('/api/tasks/:id/claim', async (c) => {
   
   return c.json({ success: true });
 });
+
+// ============ TASK DEPENDENCIES ============
+
+// Get dependencies for a task
+app.get('/api/tasks/:id/dependencies', async (c) => {
+  const taskId = c.req.param('id');
+  
+  // Get tasks this task depends on (blockers)
+  const blockers = await c.env.DB.prepare(`
+    SELECT t.id, t.title, t.status, t.priority, td.created_at as dependency_created_at
+    FROM task_dependencies td
+    JOIN tasks t ON t.id = td.depends_on_task_id
+    WHERE td.task_id = ?
+    ORDER BY td.created_at DESC
+  `).bind(taskId).all();
+  
+  // Get tasks that depend on this task (blocked by this)
+  const blocking = await c.env.DB.prepare(`
+    SELECT t.id, t.title, t.status, t.priority, td.created_at as dependency_created_at
+    FROM task_dependencies td
+    JOIN tasks t ON t.id = td.task_id
+    WHERE td.depends_on_task_id = ?
+    ORDER BY td.created_at DESC
+  `).bind(taskId).all();
+  
+  // Check if task is blocked (any non-done blocker)
+  const isBlocked = (blockers.results as any[]).some(b => b.status !== 'done');
+  
+  return c.json({ 
+    blockers: blockers.results,
+    blocking: blocking.results,
+    is_blocked: isBlocked,
+    blocker_count: blockers.results.length,
+    blocking_count: blocking.results.length
+  });
+});
+
+// Add a dependency (task depends on another task)
+app.post('/api/tasks/:id/dependencies', async (c) => {
+  const taskId = c.req.param('id');
+  const body = await c.req.json();
+  
+  if (!body.depends_on_task_id?.trim()) {
+    return c.json({ error: 'depends_on_task_id is required' }, 400);
+  }
+  
+  const dependsOnId = body.depends_on_task_id.trim();
+  
+  // Prevent self-reference
+  if (taskId === dependsOnId) {
+    return c.json({ error: 'A task cannot depend on itself' }, 400);
+  }
+  
+  // Check both tasks exist
+  const [task, dependsOn] = await Promise.all([
+    c.env.DB.prepare('SELECT id, title, status FROM tasks WHERE id = ?').bind(taskId).first(),
+    c.env.DB.prepare('SELECT id, title, status FROM tasks WHERE id = ?').bind(dependsOnId).first(),
+  ]);
+  
+  if (!task) return c.json({ error: 'Task not found' }, 404);
+  if (!dependsOn) return c.json({ error: 'Dependency task not found' }, 404);
+  
+  // Prevent circular dependencies (basic check - A -> B -> A)
+  const wouldCreateCycle = await c.env.DB.prepare(`
+    SELECT 1 FROM task_dependencies 
+    WHERE task_id = ? AND depends_on_task_id = ?
+  `).bind(dependsOnId, taskId).first();
+  
+  if (wouldCreateCycle) {
+    return c.json({ error: 'Cannot create circular dependency' }, 400);
+  }
+  
+  try {
+    await c.env.DB.prepare(
+      'INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)'
+    ).bind(taskId, dependsOnId).run();
+    
+    // If the dependency is not done, auto-set task to blocked
+    if ((dependsOn as any).status !== 'done') {
+      await c.env.DB.prepare(
+        "UPDATE tasks SET status = 'blocked', blocked_reason = ?, updated_at = datetime('now') WHERE id = ? AND status NOT IN ('done', 'blocked')"
+      ).bind(`Blocked by: ${(dependsOn as any).title}`, taskId).run();
+      
+      await logActivity(c.env.DB, 'task_status_changed', null, taskId, 
+        `Task blocked by "${(dependsOn as any).title}"`);
+    }
+    
+    await logActivity(c.env.DB, 'task_updated', null, taskId, 
+      `Dependency added: blocked by "${(dependsOn as any).title}"`);
+    
+    return c.json({ success: true }, 201);
+  } catch (e: any) {
+    if (e.message?.includes('UNIQUE') || e.message?.includes('PRIMARY')) {
+      return c.json({ error: 'Dependency already exists' }, 409);
+    }
+    throw e;
+  }
+});
+
+// Remove a dependency
+app.delete('/api/tasks/:id/dependencies/:depId', async (c) => {
+  const taskId = c.req.param('id');
+  const depId = c.req.param('depId');
+  
+  const result = await c.env.DB.prepare(
+    'DELETE FROM task_dependencies WHERE task_id = ? AND depends_on_task_id = ?'
+  ).bind(taskId, depId).run();
+  
+  if (result.meta.changes === 0) {
+    return c.json({ error: 'Dependency not found' }, 404);
+  }
+  
+  // Check if task can be unblocked (no more incomplete dependencies)
+  const remainingBlockers = await c.env.DB.prepare(`
+    SELECT 1 FROM task_dependencies td
+    JOIN tasks t ON t.id = td.depends_on_task_id
+    WHERE td.task_id = ? AND t.status != 'done'
+    LIMIT 1
+  `).bind(taskId).first();
+  
+  if (!remainingBlockers) {
+    // Unblock the task if it was blocked
+    await c.env.DB.prepare(
+      "UPDATE tasks SET status = 'assigned', blocked_reason = NULL, updated_at = datetime('now') WHERE id = ? AND status = 'blocked'"
+    ).bind(taskId).run();
+    
+    await logActivity(c.env.DB, 'task_status_changed', null, taskId, 
+      `Task unblocked - all dependencies completed`);
+  }
+  
+  await logActivity(c.env.DB, 'task_updated', null, taskId, `Dependency removed`);
+  
+  return c.json({ success: true });
+});
+
+// Helper: Check and unblock tasks when a task is completed
+async function checkAndUnblockDependents(db: D1Database, completedTaskId: string) {
+  // Find all tasks that depend on the completed task
+  const dependents = await db.prepare(`
+    SELECT DISTINCT td.task_id 
+    FROM task_dependencies td
+    JOIN tasks t ON t.id = td.task_id
+    WHERE td.depends_on_task_id = ? AND t.status = 'blocked'
+  `).bind(completedTaskId).all();
+  
+  for (const dep of dependents.results as any[]) {
+    // Check if this dependent still has other incomplete blockers
+    const stillBlocked = await db.prepare(`
+      SELECT 1 FROM task_dependencies td
+      JOIN tasks t ON t.id = td.depends_on_task_id
+      WHERE td.task_id = ? AND t.status != 'done'
+      LIMIT 1
+    `).bind(dep.task_id).first();
+    
+    if (!stillBlocked) {
+      // Unblock the task
+      await db.prepare(
+        "UPDATE tasks SET status = 'assigned', blocked_reason = NULL, updated_at = datetime('now') WHERE id = ?"
+      ).bind(dep.task_id).run();
+      
+      await logActivity(db, 'task_status_changed', null, dep.task_id, 
+        `Task auto-unblocked - all dependencies completed`);
+      
+      // Create notification for assignees
+      const assignees = await db.prepare(
+        'SELECT agent_id FROM task_assignees WHERE task_id = ?'
+      ).bind(dep.task_id).all();
+      
+      for (const assignee of assignees.results as any[]) {
+        await createNotification(db, assignee.agent_id, dep.task_id, null,
+          'Task unblocked - ready to work on', 'status_change');
+      }
+    }
+  }
+}
 
 // ============ TAGS ============
 
