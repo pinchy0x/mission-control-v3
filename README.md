@@ -1,46 +1,70 @@
-# Mission Control v3
+# Mission Control v4
 
-Multi-agent task management system with automated workflows.
+Multi-agent task management system with teams, workspaces, and automated workflows.
 
-## Features
+## What's New in v4
 
-- 🎖️ **Multi-agent collaboration** - Content Writer, SEO Analyst, Jarvis (Lead)
-- 📝 **@mention-based routing** - Agents communicate via task comments
-- 🔄 **Automated triggers** - Tasks auto-dispatch on assignment and mentions
-- ✅ **Review workflows** - Strict quality gates with revision loops
-- 🚀 **Parallel execution** - Handle multiple tasks concurrently
+- 🏢 **Departments** - Organize teams by function (Content, Technical, Growth, Ops)
+- 👥 **Teams** - Group agents into squads with team leads
+- 📁 **Workspaces** - Separate tasks by project/client
+- 📊 **Enhanced Stats** - Full org-wide analytics
+- 🔄 **All v3 Features** - Triggers, @mentions, revision loops, parallel execution
 
 ## Architecture
 
+```
+Department → Teams → Agents
+     ↓
+Workspaces → Tasks → Messages
+```
+
 - **API**: Cloudflare Workers + D1 (SQLite)
-- **Dashboard**: Next.js 14 static export → Cloudflare Pages
+- **Dashboard**: Next.js 14 → Cloudflare Pages
 - **Agents**: OpenClaw cron jobs with isolated sessions
 
-## Endpoints
+## Default Structure
 
-- API: `https://mc-v3-api.saurabh-198.workers.dev`
-- Dashboard: `https://mc-v3-dashboard.pages.dev`
+**Departments:**
+- 🎯 Operations - Leadership and coordination
+- ✍️ Content - Content creation and SEO
+- 💻 Technical - Development and DevOps
+- 📈 Growth - Sales and marketing
 
-## Workflow
+**Teams:**
+- Content Squad, SEO Team
+- Dev Team, DevOps Team
+- Growth Team, Leadership
 
-```
-Task Created → Assigned to Content-Writer
-Content-Writer → writes content → @SEO-Analyst
-SEO-Analyst → reviews → @Content-Writer (revisions) OR @Jarvis (approved)
-Jarvis → final approval → Done
-```
+**Workspaces:**
+- QuantaCodes (main business)
+- Internal (tools/processes)
+- Clients (client projects)
+
+## API Endpoints
+
+### Core (v3)
+- `GET/POST /api/tasks`
+- `GET/POST /api/agents`
+- `POST /api/tasks/:id/assign`
+- `POST /api/tasks/:id/messages`
+- `POST /api/tasks/:id/approve`
+
+### New in v4
+- `GET/POST /api/departments`
+- `GET/POST /api/teams`
+- `GET/POST /api/workspaces`
+- `GET /api/stats/full`
 
 ## Setup
 
-### API
 ```bash
+# API
 cd api
 npm install
+npx wrangler d1 execute mission-control-v3 --file=schema-v4.sql
 npx wrangler deploy
-```
 
-### Dashboard
-```bash
+# Dashboard
 cd dashboard
 npm install
 npm run build

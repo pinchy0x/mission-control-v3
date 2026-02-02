@@ -1125,4 +1125,195 @@ async function createPendingTrigger(
   return id;
 }
 
+// ============ DEPARTMENTS ============
+
+app.get('/api/departments', async (c) => {
+  const result = await c.env.DB.prepare(`
+    SELECT d.*, 
+           COUNT(DISTINCT t.id) as team_count,
+           COUNT(DISTINCT a.id) as agent_count
+    FROM departments d
+    LEFT JOIN teams t ON t.department_id = d.id
+    LEFT JOIN agents a ON a.team_id = t.id
+    GROUP BY d.id
+    ORDER BY d.name
+  `).all();
+  return c.json({ departments: result.results });
+});
+
+app.post('/api/departments', async (c) => {
+  const body = await c.req.json();
+  const id = body.id || crypto.randomUUID().slice(0, 16);
+  
+  await c.env.DB.prepare(
+    'INSERT INTO departments (id, name, emoji, description) VALUES (?, ?, ?, ?)'
+  ).bind(id, body.name, body.emoji || '🏢', body.description || null).run();
+  
+  return c.json({ id, success: true }, 201);
+});
+
+// ============ TEAMS ============
+
+app.get('/api/teams', async (c) => {
+  const deptId = c.req.query('department_id');
+  
+  let query = `
+    SELECT t.*, 
+           d.name as department_name,
+           d.emoji as department_emoji,
+           COUNT(a.id) as agent_count,
+           l.name as lead_name,
+           l.avatar_emoji as lead_emoji
+    FROM teams t
+    LEFT JOIN departments d ON d.id = t.department_id
+    LEFT JOIN agents a ON a.team_id = t.id
+    LEFT JOIN agents l ON l.id = t.lead_agent_id
+  `;
+  
+  if (deptId) {
+    query += ` WHERE t.department_id = '${deptId}'`;
+  }
+  
+  query += ` GROUP BY t.id ORDER BY d.name, t.name`;
+  
+  const result = await c.env.DB.prepare(query).all();
+  return c.json({ teams: result.results });
+});
+
+app.get('/api/teams/:id', async (c) => {
+  const team = await c.env.DB.prepare(`
+    SELECT t.*, d.name as department_name
+    FROM teams t
+    LEFT JOIN departments d ON d.id = t.department_id
+    WHERE t.id = ?
+  `).bind(c.req.param('id')).first();
+  
+  if (!team) return c.json({ error: 'Team not found' }, 404);
+  
+  const agents = await c.env.DB.prepare(
+    'SELECT * FROM agents WHERE team_id = ?'
+  ).bind(c.req.param('id')).all();
+  
+  return c.json({ team, agents: agents.results });
+});
+
+app.post('/api/teams', async (c) => {
+  const body = await c.req.json();
+  const id = body.id || crypto.randomUUID().slice(0, 16);
+  
+  await c.env.DB.prepare(
+    'INSERT INTO teams (id, department_id, name, emoji, description, lead_agent_id) VALUES (?, ?, ?, ?, ?, ?)'
+  ).bind(id, body.department_id, body.name, body.emoji || '👥', body.description || null, body.lead_agent_id || null).run();
+  
+  return c.json({ id, success: true }, 201);
+});
+
+app.patch('/api/teams/:id', async (c) => {
+  const body = await c.req.json();
+  const updates: string[] = [];
+  const values: any[] = [];
+  
+  for (const [key, value] of Object.entries(body)) {
+    if (['name', 'emoji', 'description', 'department_id', 'lead_agent_id'].includes(key)) {
+      updates.push(`${key} = ?`);
+      values.push(value);
+    }
+  }
+  
+  if (updates.length === 0) return c.json({ error: 'No valid fields' }, 400);
+  values.push(c.req.param('id'));
+  
+  await c.env.DB.prepare(`UPDATE teams SET ${updates.join(', ')} WHERE id = ?`).bind(...values).run();
+  return c.json({ success: true });
+});
+
+// ============ WORKSPACES ============
+
+app.get('/api/workspaces', async (c) => {
+  const result = await c.env.DB.prepare(`
+    SELECT w.*,
+           COUNT(t.id) as task_count,
+           SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) as completed_count
+    FROM workspaces w
+    LEFT JOIN tasks t ON t.workspace_id = w.id
+    GROUP BY w.id
+    ORDER BY w.name
+  `).all();
+  return c.json({ workspaces: result.results });
+});
+
+app.get('/api/workspaces/:id', async (c) => {
+  const workspace = await c.env.DB.prepare(
+    'SELECT * FROM workspaces WHERE id = ?'
+  ).bind(c.req.param('id')).first();
+  
+  if (!workspace) return c.json({ error: 'Workspace not found' }, 404);
+  
+  const tasks = await c.env.DB.prepare(
+    'SELECT * FROM tasks WHERE workspace_id = ? ORDER BY created_at DESC LIMIT 50'
+  ).bind(c.req.param('id')).all();
+  
+  return c.json({ workspace, tasks: tasks.results });
+});
+
+app.post('/api/workspaces', async (c) => {
+  const body = await c.req.json();
+  const id = body.id || crypto.randomUUID().slice(0, 16);
+  const slug = body.slug || body.name.toLowerCase().replace(/\s+/g, '-');
+  
+  await c.env.DB.prepare(
+    'INSERT INTO workspaces (id, name, slug, emoji, description) VALUES (?, ?, ?, ?, ?)'
+  ).bind(id, body.name, slug, body.emoji || '📁', body.description || null).run();
+  
+  return c.json({ id, success: true }, 201);
+});
+
+app.patch('/api/workspaces/:id', async (c) => {
+  const body = await c.req.json();
+  const updates: string[] = [];
+  const values: any[] = [];
+  
+  for (const [key, value] of Object.entries(body)) {
+    if (['name', 'slug', 'emoji', 'description', 'status'].includes(key)) {
+      updates.push(`${key} = ?`);
+      values.push(value);
+    }
+  }
+  
+  if (updates.length === 0) return c.json({ error: 'No valid fields' }, 400);
+  values.push(c.req.param('id'));
+  
+  await c.env.DB.prepare(`UPDATE workspaces SET ${updates.join(', ')} WHERE id = ?`).bind(...values).run();
+  return c.json({ success: true });
+});
+
+// ============ ENHANCED STATS ============
+
+app.get('/api/stats/full', async (c) => {
+  const [depts, teams, agents, workspaces, tasksByStatus, tasksByWorkspace] = await Promise.all([
+    c.env.DB.prepare('SELECT COUNT(*) as count FROM departments').first(),
+    c.env.DB.prepare('SELECT COUNT(*) as count FROM teams').first(),
+    c.env.DB.prepare('SELECT COUNT(*) as count FROM agents').first(),
+    c.env.DB.prepare('SELECT COUNT(*) as count FROM workspaces WHERE status = "active"').first(),
+    c.env.DB.prepare(`
+      SELECT status, COUNT(*) as count FROM tasks GROUP BY status
+    `).all(),
+    c.env.DB.prepare(`
+      SELECT w.name, COUNT(t.id) as count 
+      FROM workspaces w 
+      LEFT JOIN tasks t ON t.workspace_id = w.id 
+      GROUP BY w.id
+    `).all(),
+  ]);
+  
+  return c.json({
+    departments: (depts as any)?.count || 0,
+    teams: (teams as any)?.count || 0,
+    agents: (agents as any)?.count || 0,
+    workspaces: (workspaces as any)?.count || 0,
+    tasksByStatus: tasksByStatus.results,
+    tasksByWorkspace: tasksByWorkspace.results,
+  });
+});
+
 export default app;

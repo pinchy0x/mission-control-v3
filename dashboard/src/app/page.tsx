@@ -13,6 +13,26 @@ type Agent = {
   level: string;
   avatar_emoji: string;
   current_task_id: string | null;
+  team_id?: string;
+  team_name?: string;
+  department?: string;
+};
+
+type Team = {
+  id: string;
+  name: string;
+  emoji: string;
+  department_name: string;
+  agent_count: number;
+};
+
+type Workspace = {
+  id: string;
+  name: string;
+  slug: string;
+  emoji: string;
+  task_count: number;
+  completed_count: number;
 };
 
 type Task = {
@@ -152,6 +172,10 @@ export default function Dashboard() {
   const [taskMessages, setTaskMessages] = useState<{id: string; content: string; from_agent_name: string; avatar_emoji: string; created_at: string}[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [selectedWorkspace, setSelectedWorkspace] = useState<string>('all');
+  const [viewMode, setViewMode] = useState<'board' | 'teams'>('board');
 
   useEffect(() => {
     loadData();
@@ -178,16 +202,20 @@ export default function Dashboard() {
   async function loadData() {
     try {
       setError(null);
-      const [agentsData, tasksData, activitiesData, tagsData] = await Promise.all([
+      const [agentsData, tasksData, activitiesData, tagsData, teamsData, workspacesData] = await Promise.all([
         fetchAPI('/api/agents'),
         fetchAPI('/api/tasks'),
         fetchAPI('/api/activities?limit=20'),
         fetchAPI('/api/tags'),
+        fetchAPI('/api/teams'),
+        fetchAPI('/api/workspaces'),
       ]);
       setAgents(agentsData?.agents || []);
       setTasks(tasksData?.tasks || []);
       setActivities(activitiesData?.activities || []);
       setTags(tagsData?.tags || []);
+      setTeams(teamsData?.teams || []);
+      setWorkspaces(workspacesData?.workspaces || []);
     } catch (e) {
       console.error('Failed to load data:', e);
       setError('Failed to load data. Pull to refresh.');
@@ -400,6 +428,32 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="hidden md:flex items-center gap-4">
+            {/* Workspace Selector */}
+            <select
+              value={selectedWorkspace}
+              onChange={(e) => setSelectedWorkspace(e.target.value)}
+              className="bg-stone-700 text-amber-50 px-3 py-2 rounded text-sm border border-stone-600 focus:border-amber-500 outline-none"
+            >
+              <option value="all">All Workspaces</option>
+              {workspaces.map(ws => (
+                <option key={ws.id} value={ws.id}>{ws.emoji} {ws.name}</option>
+              ))}
+            </select>
+            {/* View Mode Toggle */}
+            <div className="flex bg-stone-700 rounded overflow-hidden">
+              <button
+                onClick={() => setViewMode('board')}
+                className={`px-3 py-2 text-sm ${viewMode === 'board' ? 'bg-amber-600 text-white' : 'text-stone-300 hover:text-white'}`}
+              >
+                📋 Board
+              </button>
+              <button
+                onClick={() => setViewMode('teams')}
+                className={`px-3 py-2 text-sm ${viewMode === 'teams' ? 'bg-amber-600 text-white' : 'text-stone-300 hover:text-white'}`}
+              >
+                👥 Teams
+              </button>
+            </div>
             <button
               onClick={openDocs}
               className="bg-amber-600 hover:bg-amber-500 text-white px-4 py-2 rounded text-sm font-medium transition-colors"
