@@ -162,7 +162,7 @@ app.patch('/api/agents/:id', async (c) => {
   const values: any[] = [];
   
   for (const [key, value] of Object.entries(body)) {
-    if (['name', 'role', 'status', 'level', 'current_task_id', 'avatar_emoji', 'cron_job_id'].includes(key)) {
+    if (['name', 'role', 'status', 'level', 'current_task_id', 'avatar_emoji', 'cron_job_id', 'team_id', 'department'].includes(key)) {
       updates.push(`${key} = ?`);
       values.push(value);
     }
