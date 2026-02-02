@@ -112,3 +112,53 @@ CREATE INDEX IF NOT EXISTS idx_notifications_agent ON notifications(agent_id, de
 CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_assignees_agent ON task_assignees(agent_id);
 CREATE INDEX IF NOT EXISTS idx_docs_workspace ON docs(workspace_id);
+
+-- ============ FULL-TEXT SEARCH (FTS5) ============
+
+-- FTS5 virtual table for task search
+-- Indexes: title, description, and aggregated messages
+CREATE VIRTUAL TABLE IF NOT EXISTS tasks_fts USING fts5(
+  title,
+  description,
+  messages_text,
+  task_id UNINDEXED,
+  content='',
+  contentless_delete=1
+);
+
+-- Trigger: Insert into FTS when task is created
+CREATE TRIGGER IF NOT EXISTS tasks_fts_insert AFTER INSERT ON tasks BEGIN
+  INSERT INTO tasks_fts(task_id, title, description, messages_text)
+  VALUES (NEW.id, NEW.title, COALESCE(NEW.description, ''), '');
+END;
+
+-- Trigger: Update FTS when task is updated
+CREATE TRIGGER IF NOT EXISTS tasks_fts_update AFTER UPDATE ON tasks BEGIN
+  DELETE FROM tasks_fts WHERE task_id = OLD.id;
+  INSERT INTO tasks_fts(task_id, title, description, messages_text)
+  SELECT NEW.id, NEW.title, COALESCE(NEW.description, ''),
+    COALESCE((SELECT GROUP_CONCAT(content, ' ') FROM messages WHERE task_id = NEW.id), '');
+END;
+
+-- Trigger: Delete from FTS when task is deleted
+CREATE TRIGGER IF NOT EXISTS tasks_fts_delete AFTER DELETE ON tasks BEGIN
+  DELETE FROM tasks_fts WHERE task_id = OLD.id;
+END;
+
+-- Trigger: Update FTS when message is added (to include message content)
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+  DELETE FROM tasks_fts WHERE task_id = NEW.task_id;
+  INSERT INTO tasks_fts(task_id, title, description, messages_text)
+  SELECT t.id, t.title, COALESCE(t.description, ''),
+    COALESCE((SELECT GROUP_CONCAT(content, ' ') FROM messages WHERE task_id = t.id), '')
+  FROM tasks t WHERE t.id = NEW.task_id;
+END;
+
+-- Trigger: Update FTS when message is deleted
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+  DELETE FROM tasks_fts WHERE task_id = OLD.task_id;
+  INSERT INTO tasks_fts(task_id, title, description, messages_text)
+  SELECT t.id, t.title, COALESCE(t.description, ''),
+    COALESCE((SELECT GROUP_CONCAT(content, ' ') FROM messages WHERE task_id = t.id), '')
+  FROM tasks t WHERE t.id = OLD.task_id;
+END;

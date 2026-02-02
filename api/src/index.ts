@@ -229,11 +229,117 @@ app.get('/api/agents/:id/queue', async (c) => {
   });
 });
 
+// Agent Stats - metrics for agent performance
+app.get('/api/agents/:id/stats', async (c) => {
+  const agentId = c.req.param('id');
+  
+  // Verify agent exists
+  const agent = await c.env.DB.prepare('SELECT id, name, updated_at FROM agents WHERE id = ?').bind(agentId).first() as any;
+  if (!agent) {
+    return c.json({ error: 'Agent not found' }, 404);
+  }
+  
+  // Calculate date boundaries (in UTC for SQLite comparison)
+  const now = new Date();
+  const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  
+  // Run all queries in parallel
+  const [
+    totalCompleted,
+    weekCompleted,
+    monthCompleted,
+    currentAssigned,
+    avgCompletionTime,
+    reviewStats,
+    lastActivity
+  ] = await Promise.all([
+    // Total tasks completed (all time)
+    c.env.DB.prepare(`
+      SELECT COUNT(*) as count FROM tasks t
+      JOIN task_assignees ta ON t.id = ta.task_id
+      WHERE ta.agent_id = ? AND t.status = 'done'
+    `).bind(agentId).first() as Promise<any>,
+    
+    // Tasks completed this week
+    c.env.DB.prepare(`
+      SELECT COUNT(*) as count FROM tasks t
+      JOIN task_assignees ta ON t.id = ta.task_id
+      WHERE ta.agent_id = ? AND t.status = 'done' AND t.updated_at >= ?
+    `).bind(agentId, weekAgo).first() as Promise<any>,
+    
+    // Tasks completed this month
+    c.env.DB.prepare(`
+      SELECT COUNT(*) as count FROM tasks t
+      JOIN task_assignees ta ON t.id = ta.task_id
+      WHERE ta.agent_id = ? AND t.status = 'done' AND t.updated_at >= ?
+    `).bind(agentId, monthAgo).first() as Promise<any>,
+    
+    // Currently assigned (not done/archived)
+    c.env.DB.prepare(`
+      SELECT COUNT(*) as count FROM tasks t
+      JOIN task_assignees ta ON t.id = ta.task_id
+      WHERE ta.agent_id = ? AND t.status NOT IN ('done', 'archived')
+    `).bind(agentId).first() as Promise<any>,
+    
+    // Average completion time (minutes) - from assigned_at to updated_at when done
+    c.env.DB.prepare(`
+      SELECT AVG(
+        CAST((julianday(t.updated_at) - julianday(ta.assigned_at)) * 24 * 60 AS INTEGER)
+      ) as avg_minutes
+      FROM tasks t
+      JOIN task_assignees ta ON t.id = ta.task_id
+      WHERE ta.agent_id = ? AND t.status = 'done' AND ta.assigned_at IS NOT NULL
+    `).bind(agentId).first() as Promise<any>,
+    
+    // Review stats - count rejections and total reviews for rejection rate
+    c.env.DB.prepare(`
+      SELECT 
+        COUNT(CASE WHEN n.type = 'rejection' THEN 1 END) as rejections,
+        COUNT(CASE WHEN n.type IN ('rejection', 'approval') THEN 1 END) as total_reviews
+      FROM notifications n
+      WHERE n.agent_id = ? AND n.type IN ('rejection', 'approval')
+    `).bind(agentId).first() as Promise<any>,
+    
+    // Last activity (most recent message or task update)
+    c.env.DB.prepare(`
+      SELECT MAX(created_at) as last_active FROM (
+        SELECT created_at FROM messages WHERE from_agent_id = ?
+        UNION ALL
+        SELECT created_at FROM activities WHERE agent_id = ?
+      )
+    `).bind(agentId, agentId).first() as Promise<any>
+  ]);
+  
+  // Calculate rejection rate
+  const rejectionRate = reviewStats?.total_reviews > 0 
+    ? Math.round((reviewStats.rejections / reviewStats.total_reviews) * 100) 
+    : 0;
+  
+  return c.json({
+    agent_id: agentId,
+    agent_name: agent.name,
+    tasks_completed: {
+      total: totalCompleted?.count || 0,
+      week: weekCompleted?.count || 0,
+      month: monthCompleted?.count || 0
+    },
+    avg_completion_time_minutes: avgCompletionTime?.avg_minutes 
+      ? Math.round(avgCompletionTime.avg_minutes) 
+      : null,
+    tasks_assigned: currentAssigned?.count || 0,
+    review_rejection_rate: rejectionRate,
+    last_active_at: lastActivity?.last_active || agent.updated_at
+  });
+});
+
 // ============ TASKS ============
 
 app.get('/api/tasks', async (c) => {
   const status = c.req.query('status');
   const assignee = c.req.query('assignee');
+  const parentId = c.req.query('parent_id'); // Filter by parent (null = top-level only)
+  const includeSubtasks = c.req.query('include_subtasks') !== 'false'; // Default true
   
   let query = `
     SELECT t.*, 
@@ -245,7 +351,9 @@ app.get('/api/tasks', async (c) => {
       (SELECT COUNT(*) FROM task_dependencies WHERE task_id = t.id) as blocker_count,
       (SELECT COUNT(*) FROM task_dependencies td2 
        JOIN tasks t2 ON t2.id = td2.depends_on_task_id 
-       WHERE td2.task_id = t.id AND t2.status != 'done') as incomplete_blocker_count
+       WHERE td2.task_id = t.id AND t2.status != 'done') as incomplete_blocker_count,
+      (SELECT COUNT(*) FROM tasks st WHERE st.parent_task_id = t.id) as subtask_count,
+      (SELECT COUNT(*) FROM tasks st WHERE st.parent_task_id = t.id AND st.status != 'done') as incomplete_subtask_count
     FROM tasks t
     LEFT JOIN task_assignees ta ON t.id = ta.task_id
     LEFT JOIN agents a ON ta.agent_id = a.id
@@ -264,6 +372,14 @@ app.get('/api/tasks', async (c) => {
   if (assignee) {
     conditions.push('ta.agent_id = ?');
     bindings.push(assignee);
+  }
+  
+  // Filter by parent_id (use 'null' string to get top-level tasks only)
+  if (parentId === 'null') {
+    conditions.push('t.parent_task_id IS NULL');
+  } else if (parentId) {
+    conditions.push('t.parent_task_id = ?');
+    bindings.push(parentId);
   }
   
   if (conditions.length > 0) {
@@ -285,9 +401,189 @@ app.get('/api/tasks', async (c) => {
     tag_colors: t.tag_colors ? t.tag_colors.split(',') : [],
     has_blockers: (t.blocker_count || 0) > 0,
     is_blocked: (t.incomplete_blocker_count || 0) > 0,
+    subtask_count: t.subtask_count || 0,
+    incomplete_subtask_count: t.incomplete_subtask_count || 0,
+    has_subtasks: (t.subtask_count || 0) > 0,
   }));
   
   return c.json({ tasks });
+});
+
+// ============ FULL-TEXT SEARCH ============
+
+// Search endpoint with FTS5 (with LIKE fallback)
+// NOTE: Must be defined BEFORE /api/tasks/:id to avoid route conflict
+app.get('/api/tasks/search', async (c) => {
+  const query = c.req.query('q')?.trim();
+  if (!query || query.length < 2) {
+    return c.json({ error: 'Query must be at least 2 characters', results: [] }, 400);
+  }
+  
+  const workspace = c.req.query('workspace');
+  const status = c.req.query('status');
+  const assignee = c.req.query('assignee');
+  const limit = Math.min(parseInt(c.req.query('limit') || '20'), 50);
+  
+  try {
+    // Try FTS5 first (faster, better ranking)
+    let results;
+    let usedFTS = false;
+    
+    try {
+      // FTS5 search - get matching task IDs with ranking first, then join
+      const sanitized = query.replace(/[^\w\s]/g, '').trim();
+      if (!sanitized) throw new Error('Empty query after sanitization');
+      const ftsQuery = sanitized + '*';
+      
+      // Step 1: Get matching task IDs with FTS ranking and snippets
+      const ftsResults = await c.env.DB.prepare(`
+        SELECT 
+          task_id,
+          bm25(tasks_fts) as rank,
+          snippet(tasks_fts, 1, '<mark>', '</mark>', '...', 32) as title_snippet,
+          snippet(tasks_fts, 2, '<mark>', '</mark>', '...', 64) as desc_snippet,
+          snippet(tasks_fts, 3, '<mark>', '</mark>', '...', 64) as msg_snippet
+        FROM tasks_fts
+        WHERE tasks_fts MATCH ?
+        ORDER BY rank
+        LIMIT 100
+      `).bind(ftsQuery).all();
+      
+      if (!ftsResults.results.length) {
+        results = { results: [] };
+        usedFTS = true;
+      } else {
+        // Step 2: Get full task data for matching IDs
+        const taskIds = (ftsResults.results as any[]).map(r => r.task_id);
+        const snippetMap = new Map((ftsResults.results as any[]).map(r => [r.task_id, r]));
+        
+        let sql = `
+          SELECT 
+            t.*,
+            GROUP_CONCAT(DISTINCT ta.agent_id) as assignee_ids,
+            GROUP_CONCAT(DISTINCT a.name) as assignee_names,
+            w.name as workspace_name,
+            w.emoji as workspace_emoji
+          FROM tasks t
+          LEFT JOIN task_assignees ta ON t.id = ta.task_id
+          LEFT JOIN agents a ON ta.agent_id = a.id
+          LEFT JOIN workspaces w ON t.workspace_id = w.id
+          WHERE t.id IN (${taskIds.map(() => '?').join(',')})
+        `;
+        
+        const bindings: any[] = [...taskIds];
+        
+        if (workspace && workspace !== 'all') {
+          sql += ' AND t.workspace_id = ?';
+          bindings.push(workspace);
+        }
+        if (status) {
+          sql += ' AND t.status = ?';
+          bindings.push(status);
+        }
+        if (assignee) {
+          sql += ' AND ta.agent_id = ?';
+          bindings.push(assignee);
+        }
+        
+        sql += ' GROUP BY t.id LIMIT ?';
+        bindings.push(limit);
+        
+        const taskResults = await c.env.DB.prepare(sql).bind(...bindings).all();
+        
+        // Merge FTS snippets with task data and sort by rank
+        results = {
+          results: (taskResults.results as any[]).map(t => {
+            const fts = snippetMap.get(t.id) || {};
+            return { ...t, ...fts };
+          }).sort((a, b) => (a.rank || 0) - (b.rank || 0))
+        };
+        usedFTS = true;
+      }
+    } catch (ftsError: any) {
+      // FTS5 not available or query failed, fallback to LIKE
+      console.log('FTS5 error, using LIKE fallback:', ftsError?.message || ftsError);
+      
+      const likePattern = `%${query}%`;
+      
+      let sql = `
+        SELECT DISTINCT
+          t.*,
+          CASE 
+            WHEN t.title LIKE ? THEN 3
+            WHEN t.description LIKE ? THEN 2
+            ELSE 1
+          END as rank,
+          t.title as title_snippet,
+          SUBSTR(t.description, 1, 150) as desc_snippet,
+          NULL as msg_snippet,
+          GROUP_CONCAT(DISTINCT ta.agent_id) as assignee_ids,
+          GROUP_CONCAT(DISTINCT a.name) as assignee_names,
+          w.name as workspace_name,
+          w.emoji as workspace_emoji
+        FROM tasks t
+        LEFT JOIN task_assignees ta ON t.id = ta.task_id
+        LEFT JOIN agents a ON ta.agent_id = a.id
+        LEFT JOIN workspaces w ON t.workspace_id = w.id
+        LEFT JOIN messages m ON m.task_id = t.id
+        WHERE (t.title LIKE ? OR t.description LIKE ? OR m.content LIKE ?)
+      `;
+      
+      const bindings: any[] = [likePattern, likePattern, likePattern, likePattern, likePattern];
+      
+      if (workspace && workspace !== 'all') {
+        sql += ' AND t.workspace_id = ?';
+        bindings.push(workspace);
+      }
+      if (status) {
+        sql += ' AND t.status = ?';
+        bindings.push(status);
+      }
+      if (assignee) {
+        sql += ' AND ta.agent_id = ?';
+        bindings.push(assignee);
+      }
+      
+      sql += ' GROUP BY t.id ORDER BY rank DESC, t.updated_at DESC LIMIT ?';
+      bindings.push(limit);
+      
+      const stmt = c.env.DB.prepare(sql);
+      results = await stmt.bind(...bindings).all();
+    }
+    
+    // Parse results
+    const searchResults = results.results.map((r: any) => ({
+      id: r.id,
+      title: r.title,
+      description: r.description,
+      status: r.status,
+      priority: r.priority,
+      workspace_id: r.workspace_id,
+      workspace_name: r.workspace_name,
+      workspace_emoji: r.workspace_emoji,
+      created_at: r.created_at,
+      updated_at: r.updated_at,
+      assignee_ids: r.assignee_ids ? r.assignee_ids.split(',') : [],
+      assignee_names: r.assignee_names ? r.assignee_names.split(',') : [],
+      // Snippets with highlights
+      snippets: {
+        title: r.title_snippet || r.title,
+        description: r.desc_snippet,
+        message: r.msg_snippet,
+      },
+      rank: r.rank,
+    }));
+    
+    return c.json({
+      query,
+      results: searchResults,
+      count: searchResults.length,
+      usedFTS,
+    });
+  } catch (e: any) {
+    console.error('Search error:', e);
+    return c.json({ error: 'Search failed', message: e.message }, 500);
+  }
 });
 
 app.get('/api/tasks/:id', async (c) => {
@@ -296,23 +592,88 @@ app.get('/api/tasks/:id', async (c) => {
   const task = await c.env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(id).first();
   if (!task) return c.json({ error: 'Task not found' }, 404);
   
-  const assignees = await c.env.DB.prepare(`
-    SELECT a.* FROM agents a
-    JOIN task_assignees ta ON a.id = ta.agent_id
-    WHERE ta.task_id = ?
-  `).bind(id).all();
+  const [assignees, messages, subtasks, parentTask] = await Promise.all([
+    c.env.DB.prepare(`
+      SELECT a.* FROM agents a
+      JOIN task_assignees ta ON a.id = ta.agent_id
+      WHERE ta.task_id = ?
+    `).bind(id).all(),
+    c.env.DB.prepare(`
+      SELECT m.*, a.name as from_agent_name, a.avatar_emoji
+      FROM messages m
+      LEFT JOIN agents a ON m.from_agent_id = a.id
+      WHERE m.task_id = ?
+      ORDER BY m.created_at ASC
+    `).bind(id).all(),
+    // Get subtasks with assignee info
+    c.env.DB.prepare(`
+      SELECT t.*, 
+        GROUP_CONCAT(DISTINCT a.name) as assignee_names
+      FROM tasks t
+      LEFT JOIN task_assignees ta ON t.id = ta.task_id
+      LEFT JOIN agents a ON ta.agent_id = a.id
+      WHERE t.parent_task_id = ?
+      GROUP BY t.id
+      ORDER BY t.created_at ASC
+    `).bind(id).all(),
+    // Get parent task if this is a subtask
+    (task as any).parent_task_id 
+      ? c.env.DB.prepare('SELECT id, title, status FROM tasks WHERE id = ?').bind((task as any).parent_task_id).first()
+      : Promise.resolve(null),
+  ]);
   
-  const messages = await c.env.DB.prepare(`
-    SELECT m.*, a.name as from_agent_name, a.avatar_emoji
-    FROM messages m
-    LEFT JOIN agents a ON m.from_agent_id = a.id
-    WHERE m.task_id = ?
-    ORDER BY m.created_at ASC
-  `).bind(id).all();
+  // Parse subtask assignee names
+  const parsedSubtasks = subtasks.results.map((st: any) => ({
+    ...st,
+    assignee_names: st.assignee_names ? st.assignee_names.split(',') : [],
+  }));
   
   return c.json({ 
-    task: { ...task, assignees: assignees.results },
-    messages: messages.results 
+    task: { 
+      ...task, 
+      assignees: assignees.results,
+      subtask_count: subtasks.results.length,
+      incomplete_subtask_count: subtasks.results.filter((st: any) => st.status !== 'done').length,
+    },
+    messages: messages.results,
+    subtasks: parsedSubtasks,
+    parent_task: parentTask,
+  });
+});
+
+// Get subtasks for a task
+app.get('/api/tasks/:id/subtasks', async (c) => {
+  const id = c.req.param('id');
+  
+  // Verify parent task exists
+  const task = await c.env.DB.prepare('SELECT id, title FROM tasks WHERE id = ?').bind(id).first();
+  if (!task) return c.json({ error: 'Task not found' }, 404);
+  
+  const subtasks = await c.env.DB.prepare(`
+    SELECT t.*, 
+      GROUP_CONCAT(DISTINCT ta.agent_id) as assignee_ids,
+      GROUP_CONCAT(DISTINCT a.name) as assignee_names
+    FROM tasks t
+    LEFT JOIN task_assignees ta ON t.id = ta.task_id
+    LEFT JOIN agents a ON ta.agent_id = a.id
+    WHERE t.parent_task_id = ?
+    GROUP BY t.id
+    ORDER BY 
+      CASE t.status WHEN 'done' THEN 1 ELSE 0 END,
+      t.created_at ASC
+  `).bind(id).all();
+  
+  const parsed = subtasks.results.map((st: any) => ({
+    ...st,
+    assignee_ids: st.assignee_ids ? st.assignee_ids.split(',') : [],
+    assignee_names: st.assignee_names ? st.assignee_names.split(',') : [],
+  }));
+  
+  return c.json({ 
+    parent: task,
+    subtasks: parsed,
+    count: subtasks.results.length,
+    completed: subtasks.results.filter((st: any) => st.status === 'done').length,
   });
 });
 
@@ -339,20 +700,62 @@ app.post('/api/tasks', async (c) => {
       return c.json({ error: `Invalid priority. Must be one of: ${VALID_PRIORITIES.join(', ')}` }, 400);
     }
     
+    let workspaceId = body.workspace_id || null;
+    let parentTaskId = body.parent_task_id || null;
+    
+    // Subtask validation
+    if (parentTaskId) {
+      const parentTask = await c.env.DB.prepare(
+        'SELECT id, title, workspace_id, parent_task_id FROM tasks WHERE id = ?'
+      ).bind(parentTaskId).first() as any;
+      
+      if (!parentTask) {
+        return c.json({ error: 'Parent task not found' }, 404);
+      }
+      
+      // Max 2 levels: subtask of a subtask is not allowed
+      if (parentTask.parent_task_id) {
+        return c.json({ 
+          error: 'Cannot create subtask of a subtask (max 2 levels)',
+          parent_is_subtask_of: parentTask.parent_task_id
+        }, 400);
+      }
+      
+      // Inherit workspace from parent
+      workspaceId = parentTask.workspace_id;
+    }
+    
     const id = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
     
     await c.env.DB.prepare(
       'INSERT INTO tasks (id, title, description, status, priority, workspace_id, created_by, due_date, estimated_minutes, parent_task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).bind(id, body.title.trim(), body.description || '', status, priority, body.workspace_id || null, body.created_by || null, body.due_date || null, body.estimated_minutes || null, body.parent_task_id || null).run();
+    ).bind(id, body.title.trim(), body.description || '', status, priority, workspaceId, body.created_by || null, body.due_date || null, body.estimated_minutes || null, parentTaskId).run();
     
     // Log activity (don't fail if this fails)
     try {
-      await logActivity(c.env.DB, 'task_created', body.created_by || null, id, `Task "${body.title}" created`);
+      const activityMsg = parentTaskId 
+        ? `Subtask "${body.title}" created` 
+        : `Task "${body.title}" created`;
+      await logActivity(c.env.DB, 'task_created', body.created_by || null, id, activityMsg);
     } catch (e) {
       console.error('Activity log failed:', e);
     }
     
-    return c.json({ id, success: true }, 201);
+    // Dispatch webhook event (background - use waitUntil to keep worker alive)
+    c.executionCtx.waitUntil(
+      dispatchWebhookEvent(c.env.DB, 'task_created', workspaceId, {
+        task_id: id,
+        title: body.title.trim(),
+        description: body.description || '',
+        status,
+        priority,
+        workspace_id: workspaceId,
+        parent_task_id: parentTaskId,
+        created_by: body.created_by || null
+      }, id).catch(e => console.error('Webhook dispatch failed:', e))
+    );
+    
+    return c.json({ id, success: true, parent_task_id: parentTaskId }, 201);
   } catch (e: any) {
     console.error('Create task error:', e);
     return c.json({ error: 'Failed to create task', message: e.message }, 500);
@@ -383,21 +786,20 @@ app.patch('/api/tasks/:id', async (c) => {
     }
   }
   
-  // QA GATE: Check for pending QA subtasks before allowing transition to done
+  // SUBTASK GATE: Parent can't close until ALL subtasks are done
   if (body.status === 'done' && oldTask?.status !== 'done') {
-    const pendingQASubtasks = await c.env.DB.prepare(`
+    const incompleteSubtasks = await c.env.DB.prepare(`
       SELECT id, title, status FROM tasks 
       WHERE parent_task_id = ? 
-      AND (title LIKE '%QA%' OR title LIKE '%qa%' OR title LIKE '%verification%' OR title LIKE '%Verification%')
       AND status != 'done'
     `).bind(id).all();
     
-    if (pendingQASubtasks.results.length > 0) {
-      const qaTitles = (pendingQASubtasks.results as any[]).map(t => t.title).join(', ');
+    if (incompleteSubtasks.results.length > 0) {
+      const subtaskTitles = (incompleteSubtasks.results as any[]).map(t => `${t.title} (${t.status})`).join(', ');
       return c.json({ 
-        error: 'QA verification pending',
-        pending_qa: pendingQASubtasks.results,
-        message: `Cannot close task - QA subtasks not complete: ${qaTitles}`
+        error: 'Cannot close task - incomplete subtasks exist',
+        incomplete_subtasks: incompleteSubtasks.results,
+        message: `Complete these subtasks first: ${subtaskTitles}`
       }, 409);
     }
   }
@@ -424,6 +826,17 @@ app.patch('/api/tasks/:id', async (c) => {
     
     // Notify subscribers
     await notifySubscribers(c.env.DB, id, `Task status changed to ${body.status}`, 'status_change');
+    
+    // Dispatch webhook event for status change (get workspace for routing)
+    const taskForWebhook = await c.env.DB.prepare('SELECT workspace_id, title FROM tasks WHERE id = ?').bind(id).first() as any;
+    c.executionCtx.waitUntil(
+      dispatchWebhookEvent(c.env.DB, 'task_status_changed', taskForWebhook?.workspace_id || null, {
+        task_id: id,
+        title: taskForWebhook?.title,
+        old_status: oldTask.status,
+        new_status: body.status
+      }, id).catch(e => console.error('Webhook dispatch failed:', e))
+    );
     
     // If task completed, check if any dependent tasks can be unblocked
     if (body.status === 'done') {
@@ -464,6 +877,18 @@ app.patch('/api/tasks/:id', async (c) => {
           `Auto-closed ${orphanedSubtasks.results.length} orphaned subtask(s)`);
       }
     }
+  }
+  
+  // Dispatch task_updated webhook for any update (skip if we already dispatched status_changed)
+  if (!(body.status && oldTask && body.status !== oldTask.status)) {
+    const taskForWebhook2 = await c.env.DB.prepare('SELECT workspace_id, title FROM tasks WHERE id = ?').bind(id).first() as any;
+    c.executionCtx.waitUntil(
+      dispatchWebhookEvent(c.env.DB, 'task_updated', taskForWebhook2?.workspace_id || null, {
+        task_id: id,
+        title: taskForWebhook2?.title,
+        updated_fields: Object.keys(body)
+      }, id).catch(e => console.error('Webhook dispatch failed:', e))
+    );
   }
   
   return c.json({ success: true });
@@ -514,6 +939,17 @@ app.post('/api/tasks/:id/assign', async (c) => {
   await createPendingTrigger(c.env.DB, agentId, 'task_assigned', taskId, undefined, {
     task_title: task?.title
   });
+  
+  // Dispatch webhook event for task assignment
+  const taskForWebhook = await c.env.DB.prepare('SELECT workspace_id FROM tasks WHERE id = ?').bind(taskId).first() as any;
+  c.executionCtx.waitUntil(
+    dispatchWebhookEvent(c.env.DB, 'task_assigned', taskForWebhook?.workspace_id || null, {
+      task_id: taskId,
+      task_title: task?.title,
+      assigned_agent_id: agentId,
+      assigned_agent_name: agent?.name
+    }, taskId).catch(e => console.error('Webhook dispatch failed:', e))
+  );
   
   return c.json({ success: true });
 });
@@ -570,6 +1006,21 @@ app.post('/api/tasks/:id/messages', async (c) => {
   
   await logActivity(c.env.DB, 'message_sent', body.from_agent_id, taskId, `${agent?.name || 'Agent'} commented`);
   
+  // Get task workspace for webhook routing
+  const taskForWebhook = await c.env.DB.prepare('SELECT workspace_id, title FROM tasks WHERE id = ?').bind(taskId).first() as any;
+  
+  // Dispatch message_created webhook (background)
+  c.executionCtx.waitUntil(
+    dispatchWebhookEvent(c.env.DB, 'message_sent', taskForWebhook?.workspace_id || null, {
+      message_id: id,
+      task_id: taskId,
+      task_title: taskForWebhook?.title,
+      from_agent_id: body.from_agent_id,
+      from_agent_name: agent?.name,
+      content: body.content
+    }, id).catch(e => console.error('Webhook dispatch failed:', e))
+  );
+  
   // Detect @mentions and create notifications (supports hyphenated names like @Content-Writer)
   const mentions = body.content.match(/@([\w-]+)/g) || [];
   for (const mention of mentions) {
@@ -587,6 +1038,20 @@ app.post('/api/tasks/:id/messages', async (c) => {
         mentioned_by: agent?.name,
         message_preview: body.content.slice(0, 100)
       });
+      
+      // Dispatch agent_mentioned webhook (using task's workspace, background)
+      c.executionCtx.waitUntil(
+        dispatchWebhookEvent(c.env.DB, 'agent_mentioned', taskForWebhook?.workspace_id || null, {
+          task_id: taskId,
+          task_title: taskForWebhook?.title,
+          message_id: id,
+          mentioned_agent_id: mentionedAgent.id,
+          mentioned_agent_name: mentionName,
+          mentioned_by_id: body.from_agent_id,
+          mentioned_by_name: agent?.name,
+          message_preview: body.content.slice(0, 100)
+        }, id).catch(e => console.error('Webhook dispatch failed:', e))
+      );
     }
   }
   
@@ -1592,6 +2057,576 @@ app.get('/api/stats/full', async (c) => {
     tasksByStatus: tasksByStatus.results,
     tasksByWorkspace: tasksByWorkspace.results,
   });
+});
+
+// ============ WEBHOOKS ============
+
+// Valid webhook event types
+const WEBHOOK_EVENTS = [
+  'task_created', 'task_updated', 'task_assigned', 'task_status_changed',
+  'message_sent', 'agent_mentioned', 'agent_status_changed', 'deliverable_created', 'doc_updated'
+] as const;
+
+// Helper to generate secure webhook secret
+function generateWebhookSecret(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Helper to validate HTTPS URL
+function isValidHttpsUrl(urlString: string): boolean {
+  try {
+    const url = new URL(urlString);
+    return url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+// List webhooks (optionally filter by workspace)
+app.get('/api/webhooks', async (c) => {
+  const workspaceId = c.req.query('workspace_id');
+  
+  let query = `
+    SELECT w.*, ws.name as workspace_name
+    FROM webhooks w
+    LEFT JOIN workspaces ws ON w.workspace_id = ws.id
+  `;
+  
+  if (workspaceId) {
+    query += ` WHERE w.workspace_id = ?`;
+    query += ` ORDER BY w.created_at DESC`;
+    const result = await c.env.DB.prepare(query).bind(workspaceId).all();
+    return c.json({ webhooks: result.results });
+  }
+  
+  query += ` ORDER BY w.created_at DESC`;
+  const result = await c.env.DB.prepare(query).all();
+  return c.json({ webhooks: result.results });
+});
+
+// Get single webhook
+app.get('/api/webhooks/:id', async (c) => {
+  const id = c.req.param('id');
+  
+  const webhook = await c.env.DB.prepare(`
+    SELECT w.*, ws.name as workspace_name
+    FROM webhooks w
+    LEFT JOIN workspaces ws ON w.workspace_id = ws.id
+    WHERE w.id = ?
+  `).bind(id).first();
+  
+  if (!webhook) {
+    return c.json({ error: 'Webhook not found' }, 404);
+  }
+  
+  return c.json({ webhook });
+});
+
+// Create webhook
+app.post('/api/webhooks', async (c) => {
+  const body = await c.req.json();
+  
+  // Validate required fields
+  if (!body.url?.trim()) {
+    return c.json({ error: 'url is required' }, 400);
+  }
+  
+  // Validate URL is HTTPS
+  if (!isValidHttpsUrl(body.url.trim())) {
+    return c.json({ error: 'URL must be a valid HTTPS URL' }, 400);
+  }
+  
+  // Validate events array
+  let events: string[] = [];
+  if (body.events) {
+    if (!Array.isArray(body.events)) {
+      return c.json({ error: 'events must be an array' }, 400);
+    }
+    
+    // Validate each event type
+    for (const event of body.events) {
+      if (!WEBHOOK_EVENTS.includes(event as any)) {
+        return c.json({ 
+          error: `Invalid event type: ${event}. Valid types: ${WEBHOOK_EVENTS.join(', ')}` 
+        }, 400);
+      }
+    }
+    events = body.events;
+  }
+  
+  // Generate ID and secret
+  const id = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+  const secret = generateWebhookSecret();
+  
+  await c.env.DB.prepare(`
+    INSERT INTO webhooks (id, url, events, workspace_id, secret, name, active)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    id,
+    body.url.trim(),
+    JSON.stringify(events),
+    body.workspace_id || null,
+    secret,
+    body.name?.trim() || null,
+    body.active !== false ? 1 : 0
+  ).run();
+  
+  // Log activity
+  await logActivity(c.env.DB, 'task_created', null, null, `Webhook created: ${body.name || body.url}`);
+  
+  return c.json({ 
+    id, 
+    secret,  // Return secret on creation only
+    success: true 
+  }, 201);
+});
+
+// Update webhook
+app.patch('/api/webhooks/:id', async (c) => {
+  const id = c.req.param('id');
+  const body = await c.req.json();
+  
+  const updates: string[] = [];
+  const values: any[] = [];
+  
+  // URL update
+  if (body.url !== undefined) {
+    if (!isValidHttpsUrl(body.url.trim())) {
+      return c.json({ error: 'URL must be a valid HTTPS URL' }, 400);
+    }
+    updates.push('url = ?');
+    values.push(body.url.trim());
+  }
+  
+  // Events update
+  if (body.events !== undefined) {
+    if (!Array.isArray(body.events)) {
+      return c.json({ error: 'events must be an array' }, 400);
+    }
+    for (const event of body.events) {
+      if (!WEBHOOK_EVENTS.includes(event as any)) {
+        return c.json({ 
+          error: `Invalid event type: ${event}` 
+        }, 400);
+      }
+    }
+    updates.push('events = ?');
+    values.push(JSON.stringify(body.events));
+  }
+  
+  // Name update
+  if (body.name !== undefined) {
+    updates.push('name = ?');
+    values.push(body.name?.trim() || null);
+  }
+  
+  // Active toggle
+  if (body.active !== undefined) {
+    updates.push('active = ?');
+    values.push(body.active ? 1 : 0);
+  }
+  
+  // Workspace update
+  if (body.workspace_id !== undefined) {
+    updates.push('workspace_id = ?');
+    values.push(body.workspace_id || null);
+  }
+  
+  if (updates.length === 0) {
+    return c.json({ error: 'No valid fields to update' }, 400);
+  }
+  
+  updates.push("updated_at = datetime('now')");
+  values.push(id);
+  
+  const result = await c.env.DB.prepare(
+    `UPDATE webhooks SET ${updates.join(', ')} WHERE id = ?`
+  ).bind(...values).run();
+  
+  if (result.meta.changes === 0) {
+    return c.json({ error: 'Webhook not found' }, 404);
+  }
+  
+  return c.json({ success: true });
+});
+
+// Delete webhook
+app.delete('/api/webhooks/:id', async (c) => {
+  const id = c.req.param('id');
+  
+  const result = await c.env.DB.prepare(
+    'DELETE FROM webhooks WHERE id = ?'
+  ).bind(id).run();
+  
+  if (result.meta.changes === 0) {
+    return c.json({ error: 'Webhook not found' }, 404);
+  }
+  
+  return c.json({ success: true });
+});
+
+// Regenerate webhook secret
+app.post('/api/webhooks/:id/regenerate-secret', async (c) => {
+  const id = c.req.param('id');
+  const newSecret = generateWebhookSecret();
+  
+  const result = await c.env.DB.prepare(
+    "UPDATE webhooks SET secret = ?, updated_at = datetime('now') WHERE id = ?"
+  ).bind(newSecret, id).run();
+  
+  if (result.meta.changes === 0) {
+    return c.json({ error: 'Webhook not found' }, 404);
+  }
+  
+  return c.json({ secret: newSecret, success: true });
+});
+
+// ============ WEBHOOK DELIVERIES & RETRY LOGIC ============
+
+// Calculate exponential backoff with jitter (in seconds)
+function calculateBackoff(attempt: number): number {
+  const base = 60; // 1 minute base
+  const maxDelay = 3600; // 1 hour max
+  const delay = Math.min(base * Math.pow(2, attempt), maxDelay);
+  const jitter = delay * 0.2 * Math.random(); // 20% jitter
+  return Math.floor(delay + jitter);
+}
+
+// Create HMAC signature for webhook payload
+async function signPayload(payload: string, secret: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(payload));
+  return Array.from(new Uint8Array(signature))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+// Deliver webhook (internal helper)
+async function deliverWebhook(
+  db: D1Database,
+  webhookId: string,
+  url: string,
+  secret: string,
+  eventType: string,
+  eventId: string | null,
+  payload: object
+): Promise<{ success: boolean; statusCode?: number; error?: string; deliveryId: string }> {
+  const payloadStr = JSON.stringify(payload);
+  const signature = await signPayload(payloadStr, secret);
+  const deliveryId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+  const timestamp = Date.now();
+  
+  // Create delivery record
+  await db.prepare(`
+    INSERT INTO webhook_deliveries (id, webhook_id, event_type, event_id, payload, status, attempts)
+    VALUES (?, ?, ?, ?, ?, 'pending', 1)
+  `).bind(deliveryId, webhookId, eventType, eventId, payloadStr).run();
+  
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-MC-Signature': signature,
+        'X-MC-Timestamp': timestamp.toString(),
+        'X-MC-Event': eventType,
+        'X-MC-Delivery': deliveryId,
+      },
+      body: payloadStr,
+    });
+    
+    if (response.ok) {
+      // Success
+      await db.prepare(`
+        UPDATE webhook_deliveries 
+        SET status = 'success', last_status_code = ?, completed_at = datetime('now')
+        WHERE id = ?
+      `).bind(response.status, deliveryId).run();
+      
+      return { success: true, statusCode: response.status, deliveryId };
+    } else {
+      // Failed - schedule retry
+      const backoffSeconds = calculateBackoff(1);
+      await db.prepare(`
+        UPDATE webhook_deliveries 
+        SET status = 'retrying', 
+            last_status_code = ?, 
+            last_error = ?,
+            next_retry_at = datetime('now', '+' || ? || ' seconds')
+        WHERE id = ?
+      `).bind(response.status, `HTTP ${response.status}`, backoffSeconds, deliveryId).run();
+      
+      return { success: false, statusCode: response.status, error: `HTTP ${response.status}`, deliveryId };
+    }
+  } catch (err: any) {
+    // Network error - schedule retry
+    const backoffSeconds = calculateBackoff(1);
+    await db.prepare(`
+      UPDATE webhook_deliveries 
+      SET status = 'retrying', 
+          last_error = ?,
+          next_retry_at = datetime('now', '+' || ? || ' seconds')
+      WHERE id = ?
+    `).bind(err.message || 'Network error', backoffSeconds, deliveryId).run();
+    
+    return { success: false, error: err.message || 'Network error', deliveryId };
+  }
+}
+
+// ============ WEBHOOK EVENT DISPATCHER ============
+// Dispatches events to all matching active webhooks
+
+async function dispatchWebhookEvent(
+  db: D1Database,
+  eventType: string,
+  workspaceId: string | null,
+  data: object,
+  eventId?: string | null
+): Promise<{ dispatched: number; errors: string[] }> {
+  const errors: string[] = [];
+  let dispatched = 0;
+
+  // Dispatch webhook event
+
+  try {
+    // Find active webhooks matching workspace (or global) that subscribe to this event
+    // Events stored as JSON array, so we check with LIKE for simplicity
+    let webhooks: any[] = [];
+    const likePattern = `%"${eventType}"%`;
+    
+    if (workspaceId) {
+      // Get webhooks for specific workspace OR global webhooks (null workspace)
+      const result = await db.prepare(`
+        SELECT id, url, secret, events FROM webhooks 
+        WHERE active = 1 
+        AND (workspace_id = ? OR workspace_id IS NULL)
+        AND events LIKE ?
+      `).bind(workspaceId, likePattern).all();
+      webhooks = result.results as any[];
+    } else {
+      // Global event - only global webhooks
+      const result = await db.prepare(`
+        SELECT id, url, secret, events FROM webhooks 
+        WHERE active = 1 
+        AND workspace_id IS NULL
+        AND events LIKE ?
+      `).bind(likePattern).all();
+      webhooks = result.results as any[];
+    }
+
+    // Dispatch to each matching webhook
+    for (const webhook of webhooks) {
+      try {
+        // Build payload
+        const payload = {
+          event: eventType,
+          timestamp: new Date().toISOString(),
+          data
+        };
+
+        // Await the delivery
+        await deliverWebhook(
+          db,
+          webhook.id,
+          webhook.url,
+          webhook.secret,
+          eventType,
+          eventId || null,
+          payload
+        );
+        dispatched++;
+      } catch (err: any) {
+        errors.push(`Failed to dispatch to webhook ${webhook.id}: ${err.message}`);
+      }
+    }
+  } catch (err: any) {
+    errors.push(`Event dispatch error: ${err.message}`);
+  }
+
+  return { dispatched, errors };
+}
+
+// Test webhook endpoint - sends sample event
+app.post('/api/webhooks/:id/test', async (c) => {
+  const id = c.req.param('id');
+  
+  // Get webhook
+  const webhook = await c.env.DB.prepare(
+    'SELECT * FROM webhooks WHERE id = ?'
+  ).bind(id).first() as any;
+  
+  if (!webhook) {
+    return c.json({ error: 'Webhook not found' }, 404);
+  }
+  
+  if (!webhook.active) {
+    return c.json({ error: 'Webhook is not active' }, 400);
+  }
+  
+  // Create test payload
+  const testPayload = {
+    event: 'test',
+    webhook_id: webhook.id,
+    timestamp: new Date().toISOString(),
+    data: {
+      message: 'This is a test delivery from Mission Control',
+      test: true,
+    }
+  };
+  
+  const result = await deliverWebhook(
+    c.env.DB,
+    webhook.id,
+    webhook.url,
+    webhook.secret,
+    'test',
+    null,
+    testPayload
+  );
+  
+  return c.json({
+    success: result.success,
+    delivery_id: result.deliveryId,
+    status_code: result.statusCode,
+    error: result.error,
+  });
+});
+
+// Get webhook deliveries
+app.get('/api/webhooks/:id/deliveries', async (c) => {
+  const id = c.req.param('id');
+  const limit = parseInt(c.req.query('limit') || '20');
+  const status = c.req.query('status');
+  
+  // Verify webhook exists
+  const webhook = await c.env.DB.prepare(
+    'SELECT id FROM webhooks WHERE id = ?'
+  ).bind(id).first();
+  
+  if (!webhook) {
+    return c.json({ error: 'Webhook not found' }, 404);
+  }
+  
+  let query = `
+    SELECT * FROM webhook_deliveries
+    WHERE webhook_id = ?
+  `;
+  
+  const params: any[] = [id];
+  
+  if (status) {
+    query += ` AND status = ?`;
+    params.push(status);
+  }
+  
+  query += ` ORDER BY created_at DESC LIMIT ?`;
+  params.push(limit);
+  
+  const result = await c.env.DB.prepare(query).bind(...params).all();
+  
+  return c.json({ deliveries: result.results });
+});
+
+// Process pending retries (can be called by a cron job)
+app.post('/api/webhooks/process-retries', async (c) => {
+  // Get deliveries that need retry
+  const pending = await c.env.DB.prepare(`
+    SELECT wd.*, w.url, w.secret, w.active
+    FROM webhook_deliveries wd
+    JOIN webhooks w ON wd.webhook_id = w.id
+    WHERE wd.status = 'retrying'
+    AND wd.next_retry_at <= datetime('now')
+    AND wd.attempts < wd.max_attempts
+    AND w.active = 1
+    LIMIT 10
+  `).all();
+  
+  const results: any[] = [];
+  
+  for (const delivery of pending.results as any[]) {
+    const newAttempt = delivery.attempts + 1;
+    const payloadObj = JSON.parse(delivery.payload);
+    
+    try {
+      const signature = await signPayload(delivery.payload, delivery.secret);
+      const timestamp = Date.now();
+      
+      const response = await fetch(delivery.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-MC-Signature': signature,
+          'X-MC-Timestamp': timestamp.toString(),
+          'X-MC-Event': delivery.event_type,
+          'X-MC-Delivery': delivery.id,
+          'X-MC-Retry': newAttempt.toString(),
+        },
+        body: delivery.payload,
+      });
+      
+      if (response.ok) {
+        await c.env.DB.prepare(`
+          UPDATE webhook_deliveries 
+          SET status = 'success', attempts = ?, last_status_code = ?, completed_at = datetime('now')
+          WHERE id = ?
+        `).bind(newAttempt, response.status, delivery.id).run();
+        
+        results.push({ id: delivery.id, success: true, attempt: newAttempt });
+      } else {
+        if (newAttempt >= delivery.max_attempts) {
+          // Max retries reached - mark as failed
+          await c.env.DB.prepare(`
+            UPDATE webhook_deliveries 
+            SET status = 'failed', attempts = ?, last_status_code = ?, last_error = ?
+            WHERE id = ?
+          `).bind(newAttempt, response.status, `HTTP ${response.status} after ${newAttempt} attempts`, delivery.id).run();
+          
+          results.push({ id: delivery.id, success: false, failed: true, attempt: newAttempt });
+        } else {
+          // Schedule next retry
+          const backoffSeconds = calculateBackoff(newAttempt);
+          await c.env.DB.prepare(`
+            UPDATE webhook_deliveries 
+            SET attempts = ?, last_status_code = ?, last_error = ?,
+                next_retry_at = datetime('now', '+' || ? || ' seconds')
+            WHERE id = ?
+          `).bind(newAttempt, response.status, `HTTP ${response.status}`, backoffSeconds, delivery.id).run();
+          
+          results.push({ id: delivery.id, success: false, retry_scheduled: true, attempt: newAttempt });
+        }
+      }
+    } catch (err: any) {
+      if (newAttempt >= delivery.max_attempts) {
+        await c.env.DB.prepare(`
+          UPDATE webhook_deliveries 
+          SET status = 'failed', attempts = ?, last_error = ?
+          WHERE id = ?
+        `).bind(newAttempt, `${err.message} after ${newAttempt} attempts`, delivery.id).run();
+        
+        results.push({ id: delivery.id, success: false, failed: true, error: err.message });
+      } else {
+        const backoffSeconds = calculateBackoff(newAttempt);
+        await c.env.DB.prepare(`
+          UPDATE webhook_deliveries 
+          SET attempts = ?, last_error = ?,
+              next_retry_at = datetime('now', '+' || ? || ' seconds')
+          WHERE id = ?
+        `).bind(newAttempt, err.message, backoffSeconds, delivery.id).run();
+        
+        results.push({ id: delivery.id, success: false, retry_scheduled: true, error: err.message });
+      }
+    }
+  }
+  
+  return c.json({ processed: results.length, results });
 });
 
 export default app;
