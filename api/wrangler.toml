@@ -1,0 +1,11 @@
+name = "mc-v3-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+API_TOKEN = "mc-v3-token-2026"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "mission-control-v3"
+database_id = "76993a82-726b-43cd-8785-c49c4436630a"
