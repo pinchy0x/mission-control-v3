@@ -49,6 +49,7 @@ type Task = {
   tag_ids: string[];
   tag_names: string[];
   tag_colors: string[];
+  workspace_id?: string;
 };
 
 type Tag = {
@@ -372,10 +373,24 @@ export default function Dashboard() {
     setTaskMessages(data.messages || []);
   }
 
+  // Filter tasks by workspace if selected
+  const filteredTasks = selectedWorkspace === 'all' 
+    ? tasks 
+    : tasks.filter(t => t.workspace_id === selectedWorkspace);
+
   const tasksByStatus = statusColumns.reduce((acc, status) => {
-    acc[status] = tasks.filter(t => t.status === status);
+    acc[status] = filteredTasks.filter(t => t.status === status);
     return acc;
   }, {} as Record<string, Task[]>);
+
+  // Group agents by team for Teams view
+  const agentsByTeam = teams.reduce((acc, team) => {
+    acc[team.id] = {
+      team,
+      agents: agents.filter(a => a.team_id === team.id)
+    };
+    return acc;
+  }, {} as Record<string, { team: Team; agents: Agent[] }>);
 
   // Loading state
   if (loading && agents.length === 0) {
@@ -627,65 +642,129 @@ export default function Dashboard() {
             </div>
           )}
 
-          {/* Kanban Board */}
-          <div className="flex gap-3 md:gap-4 overflow-x-auto pb-4 -mx-4 px-4 md:mx-0 md:px-0">
-            {statusColumns.map(status => (
-              <div key={status} className="flex-shrink-0 w-[160px] md:w-auto md:flex-1 md:min-w-[180px]">
-                <div className="bg-stone-200 rounded-t px-2 md:px-3 py-2 font-medium text-stone-700 text-xs md:text-sm">
-                  {statusLabels[status]} ({tasksByStatus[status]?.length || 0})
-                </div>
-                <div className="bg-stone-100 rounded-b p-2 min-h-[300px] md:min-h-[400px] space-y-2">
-                  {tasksByStatus[status]?.map(task => {
-                    const dueInfo = formatDueDate(task.due_date, task.status);
-                    return (
-                      <div
-                        key={task.id}
-                        onClick={() => selectTask(task)}
-                        className={`bg-white rounded p-3 shadow-sm border cursor-pointer hover:shadow-md transition-shadow ${
-                          dueInfo.isOverdue ? 'border-l-4 border-l-red-500 border-stone-200' : 'border-stone-200'
-                        }`}
-                      >
-                        <div className="font-medium text-stone-800 text-sm">{task.title}</div>
-                        {task.assignee_names?.length > 0 && (
-                          <div className="text-xs text-stone-500 mt-1">
-                            {task.assignee_names.join(', ')}
+          {/* View: Board or Teams */}
+          {viewMode === 'board' ? (
+            /* Kanban Board View */
+            <div className="flex gap-3 md:gap-4 overflow-x-auto pb-4 -mx-4 px-4 md:mx-0 md:px-0">
+              {statusColumns.map(status => (
+                <div key={status} className="flex-shrink-0 w-[160px] md:w-auto md:flex-1 md:min-w-[180px]">
+                  <div className="bg-stone-200 rounded-t px-2 md:px-3 py-2 font-medium text-stone-700 text-xs md:text-sm">
+                    {statusLabels[status]} ({tasksByStatus[status]?.length || 0})
+                  </div>
+                  <div className="bg-stone-100 rounded-b p-2 min-h-[300px] md:min-h-[400px] space-y-2">
+                    {tasksByStatus[status]?.map(task => {
+                      const dueInfo = formatDueDate(task.due_date, task.status);
+                      return (
+                        <div
+                          key={task.id}
+                          onClick={() => selectTask(task)}
+                          className={`bg-white rounded p-3 shadow-sm border cursor-pointer hover:shadow-md transition-shadow ${
+                            dueInfo.isOverdue ? 'border-l-4 border-l-red-500 border-stone-200' : 'border-stone-200'
+                          }`}
+                        >
+                          <div className="font-medium text-stone-800 text-sm">{task.title}</div>
+                          {task.assignee_names?.length > 0 && (
+                            <div className="text-xs text-stone-500 mt-1">
+                              {task.assignee_names.join(', ')}
+                            </div>
+                          )}
+                          <div className="flex flex-wrap gap-1 mt-2">
+                            {task.priority === 'urgent' && (
+                              <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded">
+                                Urgent
+                              </span>
+                            )}
+                            {dueInfo.text && (
+                              <span className={`text-xs px-2 py-0.5 rounded ${
+                                dueInfo.isOverdue ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'
+                              }`}>
+                                {dueInfo.text}
+                              </span>
+                            )}
+                            {task.estimated_minutes && (
+                              <span className="text-xs bg-stone-100 text-stone-600 px-2 py-0.5 rounded">
+                                ⏱ {formatEstimate(task.estimated_minutes)}
+                              </span>
+                            )}
+                            {task.tag_names?.map((tagName, i) => (
+                              <span 
+                                key={tagName}
+                                className="text-xs px-2 py-0.5 rounded text-white"
+                                style={{ backgroundColor: task.tag_colors?.[i] || '#6b7280' }}
+                              >
+                                {tagName}
+                              </span>
+                            ))}
                           </div>
-                        )}
-                        <div className="flex flex-wrap gap-1 mt-2">
-                          {task.priority === 'urgent' && (
-                            <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded">
-                              Urgent
-                            </span>
-                          )}
-                          {dueInfo.text && (
-                            <span className={`text-xs px-2 py-0.5 rounded ${
-                              dueInfo.isOverdue ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'
-                            }`}>
-                              {dueInfo.text}
-                            </span>
-                          )}
-                          {task.estimated_minutes && (
-                            <span className="text-xs bg-stone-100 text-stone-600 px-2 py-0.5 rounded">
-                              ⏱ {formatEstimate(task.estimated_minutes)}
-                            </span>
-                          )}
-                          {task.tag_names?.map((tagName, i) => (
-                            <span 
-                              key={tagName}
-                              className="text-xs px-2 py-0.5 rounded text-white"
-                              style={{ backgroundColor: task.tag_colors?.[i] || '#6b7280' }}
-                            >
-                              {tagName}
-                            </span>
-                          ))}
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          ) : (
+            /* Teams View */
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {Object.values(agentsByTeam).filter(({ agents }) => agents.length > 0).map(({ team, agents: teamAgents }) => (
+                <div key={team.id} className="bg-white rounded-lg border border-stone-200 shadow-sm overflow-hidden">
+                  <div className="bg-stone-100 px-4 py-3 border-b border-stone-200">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xl">{team.emoji}</span>
+                      <div>
+                        <div className="font-semibold text-stone-800">{team.name}</div>
+                        <div className="text-xs text-stone-500">{team.department_name}</div>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="p-4 space-y-3">
+                    {teamAgents.map(agent => {
+                      const agentTasks = filteredTasks.filter(t => t.assignee_ids?.includes(agent.id));
+                      const activeTasks = agentTasks.filter(t => !['done', 'blocked'].includes(t.status));
+                      return (
+                        <div 
+                          key={agent.id}
+                          onClick={() => loadAgentQueue(agent)}
+                          className="flex items-center gap-3 p-2 rounded hover:bg-stone-50 cursor-pointer"
+                        >
+                          <span className="text-2xl">{agent.avatar_emoji}</span>
+                          <div className="flex-1">
+                            <div className="font-medium text-stone-800">{agent.name}</div>
+                            <div className="text-xs text-stone-500">{agent.role}</div>
+                          </div>
+                          <div className="text-right">
+                            <div className={`text-xs px-2 py-1 rounded ${
+                              agent.status === 'active' ? 'bg-green-100 text-green-700' :
+                              agent.status === 'blocked' ? 'bg-red-100 text-red-700' :
+                              'bg-stone-100 text-stone-600'
+                            }`}>
+                              {agent.status}
+                            </div>
+                            {activeTasks.length > 0 && (
+                              <div className="text-xs text-stone-500 mt-1">
+                                {activeTasks.length} active
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+              {/* Show empty teams */}
+              {Object.values(agentsByTeam).filter(({ agents }) => agents.length === 0).length > 0 && (
+                <div className="bg-stone-50 rounded-lg border border-dashed border-stone-300 p-4">
+                  <div className="text-sm text-stone-500 mb-2">Empty Teams</div>
+                  {Object.values(agentsByTeam).filter(({ agents }) => agents.length === 0).map(({ team }) => (
+                    <div key={team.id} className="text-xs text-stone-400 py-1">
+                      {team.emoji} {team.name}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Task Detail Modal */}
           {selectedTask && (

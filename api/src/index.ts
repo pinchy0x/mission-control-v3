@@ -27,9 +27,18 @@ app.onError((err, c) => {
   return c.json({ error: 'Internal server error', message: err.message }, 500);
 });
 
-// CORS - restricted to dashboard and localhost for dev
+// CORS - allow dashboard and all preview deployments
 app.use('*', cors({
-  origin: ['https://mc-v3-dashboard.pages.dev', 'http://localhost:3000', 'http://localhost:5173'],
+  origin: (origin) => {
+    if (!origin) return 'https://mc-v3-dashboard.pages.dev';
+    // Allow main domain, all preview deployments, and localhost
+    if (origin.endsWith('.mc-v3-dashboard.pages.dev') || 
+        origin === 'https://mc-v3-dashboard.pages.dev' ||
+        origin.startsWith('http://localhost')) {
+      return origin;
+    }
+    return 'https://mc-v3-dashboard.pages.dev';
+  },
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
