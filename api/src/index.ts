@@ -78,6 +78,11 @@ async function timingSafeEqual(a: string, b: string): Promise<boolean> {
 
 // Auth middleware with timing-safe comparison
 app.use('/api/*', async (c, next) => {
+  // Skip auth for public endpoints
+  if (c.req.path === '/api/ping') {
+    return await next();
+  }
+  
   const auth = c.req.header('Authorization');
   if (!auth) {
     return c.json({ error: 'Unauthorized' }, 401);
@@ -94,6 +99,9 @@ app.use('/api/*', async (c, next) => {
 
 // Health check
 app.get('/health', (c) => c.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+// Public ping endpoint
+app.get('/api/ping', (c) => c.json({ pong: true, timestamp: new Date().toISOString() }));
 
 // Stats with simple caching
 let statsCache: { data: any; expires: number } = { data: null, expires: 0 };
@@ -297,7 +305,7 @@ app.get('/api/tasks/:id', async (c) => {
   const messages = await c.env.DB.prepare(`
     SELECT m.*, a.name as from_agent_name, a.avatar_emoji
     FROM messages m
-    JOIN agents a ON m.from_agent_id = a.id
+    LEFT JOIN agents a ON m.from_agent_id = a.id
     WHERE m.task_id = ?
     ORDER BY m.created_at ASC
   `).bind(id).all();
@@ -334,8 +342,8 @@ app.post('/api/tasks', async (c) => {
     const id = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
     
     await c.env.DB.prepare(
-      'INSERT INTO tasks (id, title, description, status, priority, workspace_id, created_by, due_date, estimated_minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-    ).bind(id, body.title.trim(), body.description || '', status, priority, body.workspace_id || null, body.created_by || null, body.due_date || null, body.estimated_minutes || null).run();
+      'INSERT INTO tasks (id, title, description, status, priority, workspace_id, created_by, due_date, estimated_minutes, parent_task_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    ).bind(id, body.title.trim(), body.description || '', status, priority, body.workspace_id || null, body.created_by || null, body.due_date || null, body.estimated_minutes || null, body.parent_task_id || null).run();
     
     // Log activity (don't fail if this fails)
     try {
@@ -375,11 +383,30 @@ app.patch('/api/tasks/:id', async (c) => {
     }
   }
   
+  // QA GATE: Check for pending QA subtasks before allowing transition to done
+  if (body.status === 'done' && oldTask?.status !== 'done') {
+    const pendingQASubtasks = await c.env.DB.prepare(`
+      SELECT id, title, status FROM tasks 
+      WHERE parent_task_id = ? 
+      AND (title LIKE '%QA%' OR title LIKE '%qa%' OR title LIKE '%verification%' OR title LIKE '%Verification%')
+      AND status != 'done'
+    `).bind(id).all();
+    
+    if (pendingQASubtasks.results.length > 0) {
+      const qaTitles = (pendingQASubtasks.results as any[]).map(t => t.title).join(', ');
+      return c.json({ 
+        error: 'QA verification pending',
+        pending_qa: pendingQASubtasks.results,
+        message: `Cannot close task - QA subtasks not complete: ${qaTitles}`
+      }, 409);
+    }
+  }
+  
   const updates: string[] = [];
   const values: any[] = [];
   
   for (const [key, value] of Object.entries(body)) {
-    if (['title', 'description', 'status', 'priority', 'workspace_id', 'deliverable_path', 'due_date', 'blocked_reason', 'estimated_minutes'].includes(key)) {
+    if (['title', 'description', 'status', 'priority', 'workspace_id', 'deliverable_path', 'due_date', 'blocked_reason', 'estimated_minutes', 'parent_task_id'].includes(key)) {
       updates.push(`${key} = ?`);
       values.push(value);
     }
@@ -401,6 +428,41 @@ app.patch('/api/tasks/:id', async (c) => {
     // If task completed, check if any dependent tasks can be unblocked
     if (body.status === 'done') {
       await checkAndUnblockDependents(c.env.DB, id);
+      
+      // Auto-close orphaned subtasks (assigned/in_progress) when parent completes
+      const orphanedSubtasks = await c.env.DB.prepare(`
+        SELECT id, title, status FROM tasks 
+        WHERE parent_task_id = ? 
+        AND status IN ('assigned', 'in_progress')
+      `).bind(id).all();
+      
+      for (const subtask of orphanedSubtasks.results as any[]) {
+        // Update subtask status to done
+        await c.env.DB.prepare(
+          "UPDATE tasks SET status = 'done', updated_at = datetime('now') WHERE id = ?"
+        ).bind(subtask.id).run();
+        
+        // Add message to subtask using System agent
+        const systemAgent = await c.env.DB.prepare(
+          "SELECT id FROM agents WHERE name = 'System' LIMIT 1"
+        ).first() as any;
+        
+        if (systemAgent) {
+          const msgId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+          await c.env.DB.prepare(
+            'INSERT INTO messages (id, task_id, from_agent_id, content) VALUES (?, ?, ?, ?)'
+          ).bind(msgId, subtask.id, systemAgent.id, '[SYSTEM] Auto-closed: parent task completed').run();
+        }
+        
+        await logActivity(c.env.DB, 'task_status_changed', null, subtask.id, 
+          `Auto-closed: parent task completed`);
+      }
+      
+      // Log count of auto-closed subtasks on parent task
+      if (orphanedSubtasks.results.length > 0) {
+        await logActivity(c.env.DB, 'task_updated', null, id,
+          `Auto-closed ${orphanedSubtasks.results.length} orphaned subtask(s)`);
+      }
     }
   }
   
@@ -473,7 +535,7 @@ app.get('/api/tasks/:id/messages', async (c) => {
   const result = await c.env.DB.prepare(`
     SELECT m.*, a.name as from_agent_name, a.avatar_emoji
     FROM messages m
-    JOIN agents a ON m.from_agent_id = a.id
+    LEFT JOIN agents a ON m.from_agent_id = a.id
     WHERE m.task_id = ?
     ORDER BY m.created_at ASC
   `).bind(c.req.param('id')).all();
