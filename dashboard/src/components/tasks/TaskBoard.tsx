@@ -1,9 +1,11 @@
 'use client';
 
+import { useState } from 'react';
 import { cn } from '@/lib/utils';
 import type { Task, TaskStatus } from '@/lib/types';
 import { STATUS_COLUMNS, STATUS_LABELS } from '@/lib/types';
 import { TaskCard } from './TaskCard';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 
 interface TaskBoardProps {
   tasks: Task[];
@@ -11,7 +13,11 @@ interface TaskBoardProps {
   selectedTaskId?: string | null;
 }
 
+const DONE_INITIAL_SHOW = 5; // Show only 5 done tasks initially
+
 export function TaskBoard({ tasks, onTaskClick, selectedTaskId }: TaskBoardProps) {
+  const [showAllDone, setShowAllDone] = useState(false);
+
   const tasksByStatus = STATUS_COLUMNS.reduce((acc, status) => {
     acc[status] = tasks.filter(t => t.status === status);
     return acc;
@@ -37,19 +43,56 @@ export function TaskBoard({ tasks, onTaskClick, selectedTaskId }: TaskBoardProps
           
           {/* Column Body */}
           <div className="bg-zinc-900/50 rounded-b-lg p-2 min-h-[400px] space-y-2 border border-t-0 border-zinc-700">
-            {tasksByStatus[status]?.map(task => (
-              <TaskCard 
-                key={task.id} 
-                task={task} 
-                onClick={() => onTaskClick(task)}
-                isSelected={task.id === selectedTaskId}
-              />
-            ))}
-            {tasksByStatus[status]?.length === 0 && (
-              <div className="text-center py-8 text-zinc-600 text-sm">
-                No tasks
-              </div>
-            )}
+            {(() => {
+              const columnTasks = tasksByStatus[status] || [];
+              const isDone = status === 'done';
+              const totalCount = columnTasks.length;
+              const hiddenCount = totalCount - DONE_INITIAL_SHOW;
+              
+              // For done column, collapse to show only recent unless expanded
+              const displayTasks = (isDone && !showAllDone && totalCount > DONE_INITIAL_SHOW) 
+                ? columnTasks.slice(0, DONE_INITIAL_SHOW)
+                : columnTasks;
+
+              return (
+                <>
+                  {displayTasks.map(task => (
+                    <TaskCard 
+                      key={task.id} 
+                      task={task} 
+                      onClick={() => onTaskClick(task)}
+                      isSelected={task.id === selectedTaskId}
+                    />
+                  ))}
+                  
+                  {/* Show more/less button for Done column */}
+                  {isDone && totalCount > DONE_INITIAL_SHOW && (
+                    <button
+                      onClick={() => setShowAllDone(!showAllDone)}
+                      className="w-full py-2 px-3 text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50 rounded-lg transition-colors flex items-center justify-center gap-1"
+                    >
+                      {showAllDone ? (
+                        <>
+                          <ChevronUp className="h-3 w-3" />
+                          Show less
+                        </>
+                      ) : (
+                        <>
+                          <ChevronDown className="h-3 w-3" />
+                          Show {hiddenCount} more completed tasks
+                        </>
+                      )}
+                    </button>
+                  )}
+                  
+                  {columnTasks.length === 0 && (
+                    <div className="text-center py-8 text-zinc-600 text-sm">
+                      No tasks
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
         </div>
       ))}

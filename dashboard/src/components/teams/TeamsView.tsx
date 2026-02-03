@@ -55,11 +55,31 @@ export function TeamsView({ teams, agents, tasks, onAgentClick }: TeamsViewProps
     }
   }, [agents]);
 
+  // Role hierarchy for sorting (lower = higher rank)
+  const roleRank: Record<string, number> = {
+    'lead': 1,
+    'executive': 1,
+    'manager': 2,
+    'specialist': 3,
+    'intern': 4,
+  };
+
+  // Sort agents by role hierarchy
+  const sortByRole = (agentList: Agent[]) => {
+    return [...agentList].sort((a, b) => {
+      const rankA = roleRank[a.level || 'specialist'] || 3;
+      const rankB = roleRank[b.level || 'specialist'] || 3;
+      if (rankA !== rankB) return rankA - rankB;
+      // Secondary sort by name
+      return a.name.localeCompare(b.name);
+    });
+  };
+
   // Group agents by team
   const agentsByTeam = teams.reduce((acc, team) => {
     acc[team.id] = {
       team,
-      agents: agents.filter(a => a.team_id === team.id)
+      agents: sortByRole(agents.filter(a => a.team_id === team.id))
     };
     return acc;
   }, {} as Record<string, { team: Team; agents: Agent[] }>);
