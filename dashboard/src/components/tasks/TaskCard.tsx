@@ -6,20 +6,25 @@ import type { Task } from '@/lib/types';
 interface TaskCardProps {
   task: Task;
   onClick: () => void;
+  isSelected?: boolean;
 }
 
-export function TaskCard({ task, onClick }: TaskCardProps) {
+export function TaskCard({ task, onClick, isSelected = false }: TaskCardProps) {
   const dueInfo = formatDueDate(task.due_date, task.status);
   const isBlocked = task.is_blocked || task.status === 'blocked';
 
   return (
     <div
+      data-task-id={task.id}
+      tabIndex={0}
       onClick={onClick}
+      onKeyDown={(e) => { if (e.key === 'Enter') onClick(); }}
       className={cn(
-        'bg-white rounded p-3 shadow-sm border cursor-pointer hover:shadow-md transition-shadow',
+        'bg-white rounded p-3 shadow-sm border cursor-pointer hover:shadow-md transition-all',
         isBlocked && 'border-l-4 border-l-orange-500 border-stone-200 bg-orange-50/50',
         !isBlocked && dueInfo.isOverdue && 'border-l-4 border-l-red-500 border-stone-200',
-        !isBlocked && !dueInfo.isOverdue && 'border-stone-200'
+        !isBlocked && !dueInfo.isOverdue && 'border-stone-200',
+        isSelected && 'ring-2 ring-blue-500 ring-offset-1 shadow-lg scale-[1.02]'
       )}
     >
       <div className="flex items-start gap-2">

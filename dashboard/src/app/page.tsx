@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { fetchAPI } from '@/lib/api';
 import type { Agent, Task, Team, Workspace, Tag, Activity } from '@/lib/types';
 
@@ -12,6 +12,10 @@ import { ActivityFeed } from '@/components/activity';
 import { DocsModal } from '@/components/docs';
 import { TableView, CalendarView, ViewSwitcher, type ViewType } from '@/components/views';
 import { Button } from '@/components/ui';
+import { CommandPalette } from '@/components/command-palette';
+import { useCommandPalette } from '@/hooks/useCommandPalette';
+import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
+import { KeyboardHelpModal } from '@/components/keyboard';
 import { FileText } from 'lucide-react';
 
 export default function Dashboard() {
@@ -27,7 +31,9 @@ export default function Dashboard() {
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const [showNewTask, setShowNewTask] = useState(false);
   const [showDocs, setShowDocs] = useState(false);
+  const [showKeyboardHelp, setShowKeyboardHelp] = useState(false);
   const [selectedWorkspace, setSelectedWorkspace] = useState('all');
+  const [selectedTaskIndex, setSelectedTaskIndex] = useState(-1);
   const [viewMode, setViewMode] = useState<ViewType>(() => {
     // Load from localStorage on client
     if (typeof window !== 'undefined') {
@@ -97,6 +103,85 @@ export default function Dashboard() {
     ? tasks 
     : tasks.filter(t => t.workspace_id === selectedWorkspace);
 
+  // Get selected task ID from index for keyboard navigation
+  const selectedTaskId = selectedTaskIndex >= 0 && selectedTaskIndex < filteredTasks.length
+    ? filteredTasks[selectedTaskIndex].id
+    : null;
+
+  // Command Palette
+  const { isOpen: isCommandOpen, setIsOpen: setCommandOpen, items: commandItems, recentIds } = useCommandPalette({
+    tasks: filteredTasks,
+    agents,
+    workspaces,
+    onTaskClick: setSelectedTask,
+    onWorkspaceChange: setSelectedWorkspace,
+    onViewChange: setViewMode,
+    onCreateTask: () => setShowNewTask(true),
+    onOpenDocs: () => setShowDocs(true),
+  });
+
+  // Column names for scroll (must match STATUS_COLUMNS from types.ts)
+  const columnNames = ['inbox', 'assigned', 'in_progress', 'review', 'done'];
+
+  // Keyboard Shortcuts
+  const keyboardHandlers = useMemo(() => ({
+    onNewTask: () => setShowNewTask(true),
+    onFocusSearch: () => setCommandOpen(true),
+    onNavigateUp: () => {
+      setSelectedTaskIndex(prev => Math.max(-1, prev - 1));
+    },
+    onNavigateDown: () => {
+      setSelectedTaskIndex(prev => Math.min(filteredTasks.length - 1, prev + 1));
+    },
+    onOpenSelected: () => {
+      if (selectedTaskIndex >= 0 && selectedTaskIndex < filteredTasks.length) {
+        setSelectedTask(filteredTasks[selectedTaskIndex]);
+      }
+    },
+    onEscape: () => {
+      if (selectedTask) {
+        setSelectedTask(null);
+      } else if (showNewTask) {
+        setShowNewTask(false);
+      } else if (showDocs) {
+        setShowDocs(false);
+      } else if (showKeyboardHelp) {
+        setShowKeyboardHelp(false);
+      } else if (isCommandOpen) {
+        setCommandOpen(false);
+      } else {
+        setSelectedTaskIndex(-1);
+      }
+    },
+    onGoHome: () => setViewMode('board'),
+    onGoTasks: () => setViewMode('board'),
+    onShowHelp: () => setShowKeyboardHelp(true),
+    onJumpToColumn: (column: number) => {
+      // Only works in board view
+      if (viewMode !== 'board') {
+        setViewMode('board');
+      }
+      // Scroll to column (1-indexed -> 0-indexed)
+      const columnId = columnNames[column - 1];
+      if (columnId) {
+        const columnEl = document.querySelector(`[data-column="${columnId}"]`);
+        if (columnEl) {
+          columnEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+          // Focus first task in column
+          const firstTask = columnEl.querySelector('[data-task-id]');
+          if (firstTask) {
+            (firstTask as HTMLElement).focus();
+          }
+        }
+      }
+    },
+  }), [filteredTasks, selectedTaskIndex, selectedTask, showNewTask, showDocs, showKeyboardHelp, isCommandOpen, setCommandOpen, viewMode, columnNames]);
+
+  const { groupedShortcuts, shortcuts } = useKeyboardShortcuts({
+    handlers: keyboardHandlers,
+    enabled: true,
+  });
+
   // Loading state
   if (loading && agents.length === 0) {
     return (
@@ -140,7 +225,7 @@ export default function Dashboard() {
       />
 
       {/* Main Content */}
-      <div className="max-w-7xl mx-auto p-4 md:p-6 grid grid-cols-1 md:grid-cols-12 gap-4 md:gap-6">
+      <div className="p-4 md:p-6 grid grid-cols-1 md:grid-cols-12 gap-4 md:gap-6">
         {/* Left Sidebar - Agents */}
         <aside className="col-span-1 md:col-span-2 order-2 md:order-1">
           <AgentsSidebar 
@@ -168,6 +253,7 @@ export default function Dashboard() {
             <TaskBoard 
               tasks={filteredTasks} 
               onTaskClick={setSelectedTask}
+              selectedTaskId={selectedTaskId}
             />
           )}
 
@@ -228,6 +314,22 @@ export default function Dashboard() {
         isOpen={showDocs}
         onClose={() => setShowDocs(false)}
         workspaceId={selectedWorkspace !== 'all' ? selectedWorkspace : 'default'}
+      />
+
+      {/* Command Palette (Cmd+K) */}
+      <CommandPalette
+        isOpen={isCommandOpen}
+        onOpenChange={setCommandOpen}
+        items={commandItems}
+        recentIds={recentIds}
+      />
+
+      {/* Keyboard Shortcuts Help Modal (?) */}
+      <KeyboardHelpModal
+        isOpen={showKeyboardHelp}
+        onClose={() => setShowKeyboardHelp(false)}
+        shortcuts={shortcuts}
+        groupedShortcuts={groupedShortcuts}
       />
     </div>
   );

@@ -8,9 +8,10 @@ import { TaskCard } from './TaskCard';
 interface TaskBoardProps {
   tasks: Task[];
   onTaskClick: (task: Task) => void;
+  selectedTaskId?: string | null;
 }
 
-export function TaskBoard({ tasks, onTaskClick }: TaskBoardProps) {
+export function TaskBoard({ tasks, onTaskClick, selectedTaskId }: TaskBoardProps) {
   const tasksByStatus = STATUS_COLUMNS.reduce((acc, status) => {
     acc[status] = tasks.filter(t => t.status === status);
     return acc;
@@ -19,7 +20,7 @@ export function TaskBoard({ tasks, onTaskClick }: TaskBoardProps) {
   return (
     <div className="flex gap-4 overflow-x-auto pb-4 -mx-4 px-4 md:mx-0 md:px-0">
       {STATUS_COLUMNS.map(status => (
-        <div key={status} className="flex-shrink-0 w-[200px] md:w-auto md:flex-1 md:min-w-[200px]">
+        <div key={status} data-column={status} className="flex-shrink-0 w-[200px] md:w-auto md:flex-1 md:min-w-[200px]">
           {/* Column Header */}
           <div className={cn(
             'rounded-t-lg px-3 py-2 font-medium text-sm border border-b-0',
@@ -40,7 +41,8 @@ export function TaskBoard({ tasks, onTaskClick }: TaskBoardProps) {
               <TaskCard 
                 key={task.id} 
                 task={task} 
-                onClick={() => onTaskClick(task)} 
+                onClick={() => onTaskClick(task)}
+                isSelected={task.id === selectedTaskId}
               />
             ))}
             {tasksByStatus[status]?.length === 0 && (
