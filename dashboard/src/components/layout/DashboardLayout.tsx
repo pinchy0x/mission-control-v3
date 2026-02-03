@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { Menu, Rocket } from 'lucide-react';
 import { Sidebar } from './Sidebar';
+import { DocsModal } from '@/components/docs';
 
 interface DashboardLayoutProps {
   children: React.ReactNode;
@@ -10,13 +11,18 @@ interface DashboardLayoutProps {
 
 export function DashboardLayout({ children }: DashboardLayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [showDocs, setShowDocs] = useState(false);
 
   const openSidebar = () => setSidebarOpen(true);
   const closeSidebar = () => setSidebarOpen(false);
 
   return (
     <div className="min-h-screen bg-zinc-950">
-      <Sidebar isOpen={sidebarOpen} onClose={closeSidebar} />
+      <Sidebar 
+        isOpen={sidebarOpen} 
+        onClose={closeSidebar} 
+        onDocsClick={() => setShowDocs(true)}
+      />
       
       {/* Mobile header with hamburger menu */}
       <div className="lg:hidden fixed top-0 left-0 right-0 z-30 bg-zinc-950 border-b border-zinc-800">
@@ -41,6 +47,13 @@ export function DashboardLayout({ children }: DashboardLayoutProps) {
       <main className="lg:ml-64 pt-16 lg:pt-0">
         {children}
       </main>
+
+      {/* Docs Modal */}
+      <DocsModal
+        isOpen={showDocs}
+        onClose={() => setShowDocs(false)}
+        workspaceId="default"
+      />
     </div>
   );
 }
