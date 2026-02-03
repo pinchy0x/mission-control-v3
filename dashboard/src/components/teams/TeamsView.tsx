@@ -55,8 +55,10 @@ export function TeamsView({ teams, agents, tasks, onAgentClick }: TeamsViewProps
     }
   }, [agents]);
 
-  // Role hierarchy for sorting (lower = higher rank)
-  const roleRank: Record<string, number> = {
+  // Role hierarchy for sorting (lower = higher priority)
+  const ROLE_PRIORITY: Record<string, number> = {
+    'ceo': 0,
+    'chairman': 0,
     'lead': 1,
     'executive': 1,
     'manager': 2,
@@ -67,10 +69,19 @@ export function TeamsView({ teams, agents, tasks, onAgentClick }: TeamsViewProps
   // Sort agents by role hierarchy
   const sortByRole = (agentList: Agent[]) => {
     return [...agentList].sort((a, b) => {
-      const rankA = roleRank[a.level || 'specialist'] || 3;
-      const rankB = roleRank[b.level || 'specialist'] || 3;
-      if (rankA !== rankB) return rankA - rankB;
-      // Secondary sort by name
+      // First by level/role hierarchy
+      const levelA = ROLE_PRIORITY[a.level || 'specialist'] ?? 3;
+      const levelB = ROLE_PRIORITY[b.level || 'specialist'] ?? 3;
+      if (levelA !== levelB) return levelA - levelB;
+      
+      // Then by role name containing Lead/Manager keywords
+      const roleA = a.role?.toLowerCase() || '';
+      const roleB = b.role?.toLowerCase() || '';
+      const isLeadA = roleA.includes('lead') || roleA.includes('ceo') || roleA.includes('manager') ? 0 : 1;
+      const isLeadB = roleB.includes('lead') || roleB.includes('ceo') || roleB.includes('manager') ? 0 : 1;
+      if (isLeadA !== isLeadB) return isLeadA - isLeadB;
+      
+      // Finally alphabetically
       return a.name.localeCompare(b.name);
     });
   };

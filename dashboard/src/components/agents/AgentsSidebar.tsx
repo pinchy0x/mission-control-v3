@@ -27,10 +27,43 @@ function formatRelativeTime(dateStr: string | null): string {
   return `${diffDays}d ago`;
 }
 
+// Role hierarchy for sorting (lower = higher priority)
+const ROLE_PRIORITY: Record<string, number> = {
+  'ceo': 0,
+  'chairman': 0,
+  'lead': 1,
+  'executive': 1,
+  'manager': 2,
+  'specialist': 3,
+  'intern': 4,
+};
+
+function sortAgentsByPriority(agentList: Agent[]): Agent[] {
+  return [...agentList].sort((a, b) => {
+    // First by level/role hierarchy
+    const levelA = ROLE_PRIORITY[a.level || 'specialist'] ?? 3;
+    const levelB = ROLE_PRIORITY[b.level || 'specialist'] ?? 3;
+    if (levelA !== levelB) return levelA - levelB;
+    
+    // Then by role name containing Lead/Manager keywords
+    const roleA = a.role?.toLowerCase() || '';
+    const roleB = b.role?.toLowerCase() || '';
+    const isLeadA = roleA.includes('lead') || roleA.includes('ceo') || roleA.includes('manager') ? 0 : 1;
+    const isLeadB = roleB.includes('lead') || roleB.includes('ceo') || roleB.includes('manager') ? 0 : 1;
+    if (isLeadA !== isLeadB) return isLeadA - isLeadB;
+    
+    // Finally alphabetically
+    return a.name.localeCompare(b.name);
+  });
+}
+
 export function AgentsSidebar({ agents, onTaskClick }: AgentsSidebarProps) {
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
   const [agentQueue, setAgentQueue] = useState<Task[]>([]);
   const [agentStats, setAgentStats] = useState<Record<string, AgentStats>>({});
+  
+  // Sort agents by role priority
+  const sortedAgents = sortAgentsByPriority(agents);
 
   // Fetch stats for all agents
   useEffect(() => {
@@ -71,7 +104,7 @@ export function AgentsSidebar({ agents, onTaskClick }: AgentsSidebarProps) {
       <h2 className="text-base font-semibold mb-4 text-zinc-300">The Squad</h2>
       
       <div className="flex md:flex-col gap-3 overflow-x-auto md:overflow-visible pb-2 md:pb-0 -mx-4 px-4 md:mx-0 md:px-0">
-        {agents.map(agent => (
+        {sortedAgents.map(agent => (
           <div key={agent.id} className="flex-shrink-0 w-[160px] md:w-auto">
             <div 
               onClick={() => loadAgentQueue(agent)}
