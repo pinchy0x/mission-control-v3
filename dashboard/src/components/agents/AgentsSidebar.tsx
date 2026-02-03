@@ -27,27 +27,52 @@ function formatRelativeTime(dateStr: string | null): string {
   return `${diffDays}d ago`;
 }
 
+// Team priority (Leadership first)
+const TEAM_PRIORITY: Record<string, number> = {
+  'leadership': 1,
+  'devops-team': 2,     // Products Team (ID is devops-team)
+  'backend-team': 3,
+  'security-team': 4,
+  'qa-team': 5,
+  'growth-team': 6,
+  'content-squad': 7,
+};
+
 // Role hierarchy for sorting (lower = higher priority)
 const ROLE_PRIORITY: Record<string, number> = {
-  'ceo': 0,
   'chairman': 0,
-  'lead': 1,
-  'executive': 1,
-  'manager': 2,
-  'specialist': 3,
-  'intern': 4,
+  'ceo': 1,
+  'lead': 2,
+  'executive': 2,
+  'manager': 3,
+  'specialist': 4,
+  'intern': 5,
 };
 
 function sortAgentsByPriority(agentList: Agent[]): Agent[] {
   return [...agentList].sort((a, b) => {
-    // First by level/role hierarchy
-    const levelA = ROLE_PRIORITY[a.level || 'specialist'] ?? 3;
-    const levelB = ROLE_PRIORITY[b.level || 'specialist'] ?? 3;
+    // First check role name for Chairman/CEO (always top)
+    const roleA = a.role?.toLowerCase() || '';
+    const roleB = b.role?.toLowerCase() || '';
+    const isChairmanA = roleA.includes('chairman') ? 0 : 1;
+    const isChairmanB = roleB.includes('chairman') ? 0 : 1;
+    if (isChairmanA !== isChairmanB) return isChairmanA - isChairmanB;
+    
+    const isCeoA = roleA.includes('ceo') ? 0 : 1;
+    const isCeoB = roleB.includes('ceo') ? 0 : 1;
+    if (isCeoA !== isCeoB) return isCeoA - isCeoB;
+
+    // Then by team priority (Leadership team before Backend team)
+    const teamA = TEAM_PRIORITY[a.team_id || ''] ?? 99;
+    const teamB = TEAM_PRIORITY[b.team_id || ''] ?? 99;
+    if (teamA !== teamB) return teamA - teamB;
+
+    // Then by level hierarchy
+    const levelA = ROLE_PRIORITY[a.level || 'specialist'] ?? 4;
+    const levelB = ROLE_PRIORITY[b.level || 'specialist'] ?? 4;
     if (levelA !== levelB) return levelA - levelB;
     
     // Then by role name containing Lead/Manager keywords
-    const roleA = a.role?.toLowerCase() || '';
-    const roleB = b.role?.toLowerCase() || '';
     const isLeadA = roleA.includes('lead') || roleA.includes('ceo') || roleA.includes('manager') ? 0 : 1;
     const isLeadB = roleB.includes('lead') || roleB.includes('ceo') || roleB.includes('manager') ? 0 : 1;
     if (isLeadA !== isLeadB) return isLeadA - isLeadB;

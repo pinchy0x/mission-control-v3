@@ -55,30 +55,60 @@ export function TeamsView({ teams, agents, tasks, onAgentClick }: TeamsViewProps
     }
   }, [agents]);
 
-  // Role hierarchy for sorting (lower = higher priority)
+  // Team display priority (lower = shows first)
+  const TEAM_PRIORITY: Record<string, number> = {
+    'leadership': 1,      // Executive team - ALWAYS first
+    'devops-team': 2,     // Products Team (ID is devops-team)
+    'backend-team': 3,    // Core engineering
+    'security-team': 4,   // Infrastructure protection
+    'qa-team': 5,         // Quality assurance
+    'growth-team': 6,     // Marketing & expansion
+    'content-squad': 7,   // Content & SEO
+  };
+
+  // Role hierarchy for sorting agents (lower = higher priority)
   const ROLE_PRIORITY: Record<string, number> = {
-    'ceo': 0,
-    'chairman': 0,
-    'lead': 1,
-    'executive': 1,
-    'manager': 2,
-    'specialist': 3,
-    'intern': 4,
+    'chairman': 0,    // The human boss (Saurabh)
+    'ceo': 1,         // Company leader (Pinchy)
+    'lead': 2,        // Team leads
+    'executive': 2,
+    'manager': 3,
+    'senior': 4,
+    'specialist': 5,
+    'intern': 6,
+  };
+
+  // Sort teams by priority
+  const sortTeams = (teamList: Team[]) => {
+    return [...teamList].sort((a, b) => {
+      const priorityA = TEAM_PRIORITY[a.id] ?? 99;
+      const priorityB = TEAM_PRIORITY[b.id] ?? 99;
+      return priorityA - priorityB;
+    });
   };
 
   // Sort agents by role hierarchy
   const sortByRole = (agentList: Agent[]) => {
     return [...agentList].sort((a, b) => {
-      // First by level/role hierarchy
-      const levelA = ROLE_PRIORITY[a.level || 'specialist'] ?? 3;
-      const levelB = ROLE_PRIORITY[b.level || 'specialist'] ?? 3;
+      // First check role name for Chairman/CEO
+      const roleA = a.role?.toLowerCase() || '';
+      const roleB = b.role?.toLowerCase() || '';
+      const isChairmanA = roleA.includes('chairman') ? 0 : 1;
+      const isChairmanB = roleB.includes('chairman') ? 0 : 1;
+      if (isChairmanA !== isChairmanB) return isChairmanA - isChairmanB;
+      
+      const isCeoA = roleA.includes('ceo') ? 0 : 1;
+      const isCeoB = roleB.includes('ceo') ? 0 : 1;
+      if (isCeoA !== isCeoB) return isCeoA - isCeoB;
+
+      // Then by level hierarchy
+      const levelA = ROLE_PRIORITY[a.level || 'specialist'] ?? 5;
+      const levelB = ROLE_PRIORITY[b.level || 'specialist'] ?? 5;
       if (levelA !== levelB) return levelA - levelB;
       
       // Then by role name containing Lead/Manager keywords
-      const roleA = a.role?.toLowerCase() || '';
-      const roleB = b.role?.toLowerCase() || '';
-      const isLeadA = roleA.includes('lead') || roleA.includes('ceo') || roleA.includes('manager') ? 0 : 1;
-      const isLeadB = roleB.includes('lead') || roleB.includes('ceo') || roleB.includes('manager') ? 0 : 1;
+      const isLeadA = roleA.includes('lead') || roleA.includes('manager') ? 0 : 1;
+      const isLeadB = roleB.includes('lead') || roleB.includes('manager') ? 0 : 1;
       if (isLeadA !== isLeadB) return isLeadA - isLeadB;
       
       // Finally alphabetically
@@ -95,7 +125,13 @@ export function TeamsView({ teams, agents, tasks, onAgentClick }: TeamsViewProps
     return acc;
   }, {} as Record<string, { team: Team; agents: Agent[] }>);
 
-  const teamsWithAgents = Object.values(agentsByTeam).filter(({ agents }) => agents.length > 0);
+  const teamsWithAgentsList = Object.values(agentsByTeam).filter(({ agents }) => agents.length > 0);
+  // Sort teams by priority (Leadership first, then Products, Backend, etc.)
+  const teamsWithAgents = teamsWithAgentsList.sort((a, b) => {
+    const priorityA = TEAM_PRIORITY[a.team.id] ?? 99;
+    const priorityB = TEAM_PRIORITY[b.team.id] ?? 99;
+    return priorityA - priorityB;
+  });
   const emptyTeams = Object.values(agentsByTeam).filter(({ agents }) => agents.length === 0);
 
   return (
