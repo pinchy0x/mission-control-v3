@@ -1970,6 +1970,24 @@ app.patch('/api/teams/:id', async (c) => {
   return c.json({ success: true });
 });
 
+app.delete('/api/teams/:id', async (c) => {
+  const teamId = c.req.param('id');
+  
+  // Check if team exists
+  const team = await c.env.DB.prepare('SELECT id, name FROM teams WHERE id = ?').bind(teamId).first();
+  if (!team) return c.json({ error: 'Team not found' }, 404);
+  
+  // Check if team has agents assigned
+  const agents = await c.env.DB.prepare('SELECT COUNT(*) as count FROM agents WHERE team_id = ?').bind(teamId).first() as { count: number };
+  if (agents && agents.count > 0) {
+    return c.json({ error: 'Cannot delete team with assigned agents', agent_count: agents.count }, 400);
+  }
+  
+  // Delete the team
+  await c.env.DB.prepare('DELETE FROM teams WHERE id = ?').bind(teamId).run();
+  return c.json({ success: true, deleted: team.name });
+});
+
 // ============ WORKSPACES ============
 
 app.get('/api/workspaces', async (c) => {
